@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "lldb",
+      "request": "launch",
+      "args": [],
+      "cwd": "/Users/macbookpro/tls12-snow-leopard-merge/docs",
+      "program": "/Users/macbookpro/tls12-snow-leopard-merge/docs/build/Debug/outDebug"
+    }
+  ]
+}

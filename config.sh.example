@@ -1,0 +1,14 @@
+# config.sh.example — template for local VM access config.
+#
+# Copy this to config.sh (which is git-ignored) and fill in your values:
+#   cp config.sh.example config.sh
+#   $EDITOR config.sh
+#
+# Scripts that talk to the VM source config.sh for these values.
+
+# sudo password for the VM user (passed to `sudo -S` on the VM)
+VM_SUDO_PASS="changeme"
+
+# VM SSH targets
+VM_HOST="user@your-vm.local"
+VM_HOST_CLEAN="user@your-clean-vm.local"
