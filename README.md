@@ -97,6 +97,13 @@ sl-compat-prefix.h                Compat prefix force-included into every compil
 ssltest.c, ssltest_multi.c        TLS test programs (link -framework Security)
 ```
 
+> **Provenance pin set:** the exact upstream commit each vendored tree above
+> was taken from is recorded in
+> [`apple-security-mac-os-x-1068`](https://github.com/startergo/apple-security-mac-os-x-1068)
+> — a parallel repository of 30 git submodules (29 pinned to `aosm/*` + 1 to
+> `startergo/libsecurity_checkpw` for the reconstructed 55471). Reference
+> artifact for audit and future OS backports; not consumed by this build.
+
 ### Trust anchors
 
 The root certificates the rebuilt trust path validates against ship in-tree at
