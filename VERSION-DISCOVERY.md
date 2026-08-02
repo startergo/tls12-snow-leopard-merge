@@ -4,7 +4,9 @@ This document records why the build pins the component versions it does. Snow
 Leopard's `Security.framework` is assembled from ~30 Apple open-source component
 trees, and the correct version of each is not obvious: Apple's release tags span
 several OS versions, some components need a version other than the plain 10.6.8
-tag, and a few tags reference private headers Apple never published. The analysis
+tag, and a few tags reference private headers not shipped in the 10.6 SDK
+(or in some cases not in the component's own tree either) but available in
+companion Apple open-source repos. The analysis
 below is the "why these versions" reference for anyone building from or auditing
 this repository.
 
@@ -68,19 +70,25 @@ exceptions**, with two distinct shapes:
 
 **Private-header exception (`apple_csp`, `checkpw`).** The plain 1068 tag for
 these components `#include`s a private header that is not shipped in the 10.6
-SDK and is not co-located in the component's own source tree. The header may
-exist in a companion Apple open-source tree (`apple_csp`'s CommonCrypto
-headers — `cast.h`, `aesopt.h`, `opensslDES.h` — are present at the 1068 tag
-of `aosm/CommonCrypto` under `Source/CommonCrypto/`; `checkpw`'s
-`<DirectoryServiceMIG.h>` exists nowhere public and cannot be mig-generated
-from anything in the project), but is absent from the SDK and from the
-component tree itself. For each, a different version — a Snow Leopard
-backport or an adjacent release — was used that compiles against public APIs
-instead, with **identical exports and an unchanged linked ABI**.
+SDK and is not co-located in the component's own source tree. The header (or
+the `.defs` it is generated from) is available in a companion Apple open-source
+repo: `apple_csp`'s CommonCrypto headers — `cast.h`, `aesopt.h`, `opensslDES.h`
+— are present at the 1068 tag of `aosm/CommonCrypto` under `Source/CommonCrypto/`
+(usable directly via `xcodebuild installhdrs`); `checkpw`'s
+`<DirectoryServiceMIG.h>` is produced by mig from `aosm/DirectoryService` at the
+1068 tag (`Server/DirectoryServiceMIG.defs` + `Server/DirectoryServiceMIG_types.h`,
+which defines `kDSStdMachPortName`). So neither header is "absent upstream";
+each requires a fetch (apple_csp) or a fetch plus a mig-generation step
+(checkpw), but neither is in the 10.6 SDK or in the component's own tree. For
+each, a different version — a Snow Leopard backport or an adjacent release —
+was used that compiles against public APIs instead, with **identical exports
+and an unchanged linked ABI**.
 `apple_csp-55003` hosts the SL-backport adaptation onto the public
 CommonCryptor/CommonDigest API and the legacy-HMAC keychain-unlock
-vendoring. `checkpw-55471` is Apple's PAM rewrite (the 36064 tag is genuinely
-unbuildable from public sources).
+vendoring. `checkpw-55471` is Apple's PAM rewrite — kept because PAM is
+cleaner than adding a mig-generation step for `DirectoryServiceMIG.h`, and
+because it matches what Apple shipped by 55471; not because 36064 is
+impossible to build.
 
 **Patch-carrying exception (`ssl`).** The plain 1068 tag (40581) builds
 clean; `ssl-55002` is kept because it carries the TLS 1.2 + AES-GCM patches
@@ -98,9 +106,12 @@ deliberate divergence to host this project's TLS work, not a header issue.
     ssl         55002   1068 tag is 40581. 55002 carries the TLS 1.2 + AES-GCM
                         patches (the point of the project) on top of the SL base.
     checkpw     55471   1068 tag 36064 #includes a private <DirectoryServiceMIG.h>
-                        (kDSStdMachPortName) that exists nowhere on the system and
-                        cannot be mig-generated. 55471 uses PAM, with identical
-                        exports (_checkpw, _checkpw_internal).
+                        (kDSStdMachPortName) that is absent from the 10.6 SDK and
+                        from the checkpw tree itself; mig-generatable from
+                        aosm/DirectoryService@mac-os-x-1068 (Server/DirectoryServiceMIG.defs).
+                        55471 is kept because it is Apple's PAM rewrite --
+                        cleaner than adding the mig step. Identical exports
+                        (_checkpw, _checkpw_internal).
 
 The three exceptions were confirmed against Apple's actual `mac-os-x-1068` tags
 (`git tag --points-at mac-os-x-1068` in the `Security-55002-full` tree): apple_csp
