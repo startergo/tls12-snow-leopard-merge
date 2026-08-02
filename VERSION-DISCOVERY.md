@@ -64,15 +64,23 @@ existed for the wrong versions were dropped.
 ## AS-BUILT: the pinned version map
 
 The `comp_ver` map is a **`mac-os-x-1068` manifest with three documented
-exceptions**. The exceptions all share one root cause: **the plain 1068 tag for
-that component `#include`s private headers Apple never released publicly** (they
-are absent from the 10.6 SDK, from the published open-source trees, and from the
-system), and cannot be mig-generated or otherwise reconstructed. For each, a
-different version — a Snow Leopard build or an adjacent release — was used that
-compiles against public APIs instead, with **identical exports and an unchanged
-linked ABI**, so the framework the rest of the build links against is the same.
-This is a deliberate choice, not an oversight: the non-1068 version is kept
-precisely because its 1068 counterpart is unbuildable from public sources.
+exceptions**. The exceptions share a common shape: **the plain 1068 tag for
+that component `#include`s a private header that is not shipped in the 10.6
+SDK and is not co-located in the component's own source tree**. The header may
+exist in a companion Apple open-source tree (`apple_csp`'s CommonCrypto
+headers — `cast.h`, `aesopt.h`, `opensslDES.h` — are present at the 1068 tag
+of `aosm/CommonCrypto` under `Source/CommonCrypto/`; `checkpw`'s
+`<DirectoryServiceMIG.h>` exists nowhere public and cannot be mig-generated
+from anything in the project), but is absent from the SDK and from the
+component tree itself. For each exception, a different version — a Snow
+Leopard backport or an adjacent release — was used that compiles against
+public APIs instead, with **identical exports and an unchanged linked ABI**,
+so the framework the rest of the build links against is the same. The
+non-1068 version is kept because of what lives on it: `apple_csp-55003` hosts
+the SL-backport adaptation onto the public CommonCryptor/CommonDigest API and
+the legacy-HMAC keychain-unlock vendoring; `ssl-55002` carries the TLS 1.2 +
+AES-GCM patches that are the point of the project; `checkpw-55471` is Apple's
+PAM rewrite (the 36064 tag is genuinely unbuildable from public sources).
 
     apple_csp   55003   1068 tag 36859 #includes private CommonCrypto headers
                         (cast.h, aesopt.h, opensslDES.h) that are absent from the
@@ -134,17 +142,38 @@ parentheses and is deliberately not used:
 
 ## Version-locked trees NOT pinned by comp_ver
 
-Two additional source trees are version-locked build inputs but are resolved
+Four additional source trees are version-locked build inputs but are resolved
 outside the `comp_ver` map, so a reader auditing only `comp_ver` would miss them:
 
+- **`securityd-40600`** — the daemon source itself. Pinned by env var
+  (`SECURITYD_DIR="${SECURITYD_DIR:-securityd-40600}"` in
+  `build-consistent-framework.sh`), not by `comp_ver`. The native 10.6.8 daemon;
+  NOT the Lion-era 55009 that earlier iterations of this project used.
+- **`libsecurityd-37613`** — MIG client/server + `securityd_client` /
+  `securityd_server` framework sources. Pinned by env var
+  (`LIBSECURITYD_DIR="${LIBSECURITYD_DIR:-libsecurityd-37613}"`). This is the
+  tree that produces the `securityd_client` archive linked into
+  `Security.framework` (see `link-fat-framework.sh` COMPONENTS) — the 26th
+  framework component archive — so it is a genuine framework-link-chain input,
+  not just a daemon-side input.
 - **`libsecurity_agent-55000`** — builds the `security_agent_client` framework
-  the daemon links. It is not in `COMPS`; the daemon's client-framework chain
-  resolves it by glob (`$VM/libsecurity_agent-*/*.xcodeproj`) in the i386 build
-  block. It is a genuine build input, pinned by directory name rather than by
-  `comp_ver`.
+  the daemon links. Resolved by glob (`$VM/libsecurity_agent-*/*.xcodeproj`) in
+  the i386 build block, not by `comp_ver`. Daemon-side input.
+- **`SecurityTokend-55000`** — builds the `security_tokend_client` framework
+  the daemon links. Resolved by glob (`$VM/SecurityTokend-*/*.xcodeproj`) in
+  the i386 build block, not by `comp_ver`. Daemon-side input.
 
-So the build consumes **25** version-locked source trees: the 24 in `comp_ver`
-plus `libsecurity_agent-55000`.
+So the build consumes **29** version-locked source trees: the **25** in
+`comp_ver` (the 24 in `COMPS` plus `ssl`, which `comp_ver` resolves via its
+own case statement), plus these 4. Of those 29:
+
+- **26** are framework-link-chain inputs (the 25 `comp_ver` trees +
+  `libsecurityd-37613`, which produces `securityd_client`). This is what
+  README means by "26 framework component archives" — the 26 archives
+  `link-fat-framework.sh` links into `Security.framework`.
+- The remaining 3 (`securityd-40600`, `libsecurity_agent-55000`,
+  `SecurityTokend-55000`) are daemon-side inputs consumed by the daemon link
+  chain, not `Security.framework`.
 
 ## Provenance-only trees (shipped, not read by the build)
 
