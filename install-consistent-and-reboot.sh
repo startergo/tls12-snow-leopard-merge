@@ -39,6 +39,28 @@ sudo_do() { echo "$PW" | sudo -S "$@"; }
 [ -f "$DAEMON" ] || { echo "FATAL: daemon not found: $DAEMON"; exit 1; }
 
 # -----------------------------------------------------------------------------
+# Trust-anchor preflight. sslVerifyCertChainOpenSSL in the rebuilt framework
+# reads /usr/local/SecurityPieces/ssl_anchors.pem at this LITERAL hardcoded
+# path; if absent, cert validation fails with "cannot open anchor bundle". The
+# install script does NOT stage the anchors -- STAGE=bootstrap does (from
+# vendor/anchors/ssl_anchors.pem). Warn rather than fail, so users who have
+# manually staged the anchors differently can still proceed.
+ANCHORS="/usr/local/SecurityPieces/ssl_anchors.pem"
+if [ ! -f "$ANCHORS" ]; then
+  echo "WARNING: $ANCHORS is missing."
+  echo "         The rebuilt framework reads trust roots from this exact"
+  echo "         hardcoded path (in sslVerifyCertChainOpenSSL). Without it,"
+  echo "         cert validation fails with 'cannot open anchor bundle' and"
+  echo "         HTTPS fetches return errors."
+  echo "         Fix: run STAGE=bootstrap on this machine, or copy"
+  echo "         vendor/anchors/ssl_anchors.pem from the source tree to"
+  echo "         /usr/local/SecurityPieces/ssl_anchors.pem on the target."
+else
+  NCERTS=$(grep -c 'BEGIN CERTIFICATE' "$ANCHORS" 2>/dev/null || echo "?")
+  echo "=== anchors present: $ANCHORS ($NCERTS certs) ==="
+fi
+
+# -----------------------------------------------------------------------------
 echo "=== preflight: verify all fixes present in $FW ==="
 X=$(mktemp -t tls12inst); lipo -thin x86_64 "$FW" -output "$X" 2>/dev/null || cp "$FW" "$X"
 echo "  abtd=$(nm "$X" 2>/dev/null|grep -c KeychainImpl15aboutToDestruct)" \

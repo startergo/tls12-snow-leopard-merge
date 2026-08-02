@@ -153,6 +153,33 @@ The script prints a single-user-mode recovery command before it prompts. **Note
 it down.** If a reboot ever hangs, boot to single-user mode (⌘-S) and run it to
 restore the stock framework, daemon, and cache.
 
+### Runtime requirement: trust anchors at a hardcoded path
+
+The rebuilt framework's cert-chain verifier (`sslVerifyCertChainOpenSSL`) reads
+trust roots from `/usr/local/SecurityPieces/ssl_anchors.pem` at that literal
+hardcoded path. The path is baked into the framework binary; it cannot be
+configured via environment variable or framework preferences.
+
+`STAGE=bootstrap` stages the anchors (from `vendor/anchors/ssl_anchors.pem`,
+219 roots) into `/usr/local/SecurityPieces/` as part of the build's normal
+header-pieces staging. So on a build-then-install-same-machine flow — the
+documented one — the anchors are already present when you run
+`install-consistent-and-reboot.sh`, and cert validation works out of the box.
+
+**The install script does NOT stage or verify the anchors.** It only installs
+the framework + daemon binaries and rebuilds the dyld cache. The script does
+include a preflight that *warns* (does not fail) if the anchors are missing.
+So:
+
+- On the build host: anchors are present from bootstrap; install works.
+- On a different 10.6.8 machine that received only the binaries: anchors are
+  absent, cert validation fails silently with `cannot open anchor bundle`,
+  HTTPS fetches return errors, and the only signal is in `system.log`.
+
+If you are copying just the binaries to another machine, also copy
+`vendor/anchors/ssl_anchors.pem` to `/usr/local/SecurityPieces/ssl_anchors.pem`
+on the target (creating `/usr/local/SecurityPieces/` if needed).
+
 ## 4. Verify
 
 After reboot, reconnect and check. Unlocking the keychain should return 0, the
