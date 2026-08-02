@@ -56,8 +56,15 @@ if [ ! -f "$ANCHORS" ]; then
   echo "         vendor/anchors/ssl_anchors.pem from the source tree to"
   echo "         /usr/local/SecurityPieces/ssl_anchors.pem on the target."
 else
-  NCERTS=$(grep -c 'BEGIN CERTIFICATE' "$ANCHORS" 2>/dev/null || echo "?")
+  # awk (not grep -c) so 0 matches prints as 0 rather than tripping `|| ...`
+  # via grep's exit-1-on-no-match.
+  NCERTS=$(awk '/BEGIN CERTIFICATE/{c++} END {print c+0}' "$ANCHORS" 2>/dev/null)
+  [ -z "$NCERTS" ] && NCERTS="? (unreadable)"
   echo "=== anchors present: $ANCHORS ($NCERTS certs) ==="
+  if [ "$NCERTS" = "0" ]; then
+    echo "  WARNING: anchors file exists but contains 0 certificates."
+    echo "           Cert validation will fail just as if the file were missing."
+  fi
 fi
 
 # -----------------------------------------------------------------------------

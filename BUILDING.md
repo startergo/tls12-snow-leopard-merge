@@ -166,10 +166,11 @@ header-pieces staging. So on a build-then-install-same-machine flow — the
 documented one — the anchors are already present when you run
 `install-consistent-and-reboot.sh`, and cert validation works out of the box.
 
-**The install script does NOT stage or verify the anchors.** It only installs
-the framework + daemon binaries and rebuilds the dyld cache. The script does
-include a preflight that *warns* (does not fail) if the anchors are missing.
-So:
+**The install script does NOT stage the anchors.** It only installs the
+framework + daemon binaries and rebuilds the dyld cache. The script *does*
+include a preflight that warns (does not fail) if the hardcoded bundle is
+missing or contains zero certificates — but the preflight does not stage
+them. So:
 
 - On the build host: anchors are present from bootstrap; install works.
 - On a different 10.6.8 machine that received only the binaries: anchors are
