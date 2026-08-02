@@ -981,14 +981,15 @@ if [ "$STAGE" = "all" ] || [ "$STAGE" = "components" ]; then
               "$VM/libsecurity_utilities-55010/lib" 4 \
               "vproc++.cpp" "SL-BACKPORT"
   # apple_csp: the SL public-API backport. Both the 1068 tag (36859) and stock
-  # 55003 #include private CommonCrypto headers (cast.h, aesopt.h, opensslDES.h,
-  # CommonCryptorSPI.h) that are NOT in the 10.6 SDK. They ARE public -- aosm/
-  # CommonCrypto at tag mac-os-x-1068 carries cast.h/aesopt.h/opensslDES.h under
-  # Source/CommonCrypto/, and CommonCryptorSPI.h's equivalent under the older
-  # naming as Source/CommonCryptorPriv.h (see comp_ver apple_csp comment +
-  # Netzel's recipe). This rewrite replaces the cast/des/rc4/gladman/Mac cipher
-  # contexts with the PUBLIC CommonCryptor.h / CommonDigest.h API so they build
-  # against the 10.6 SDK without needing those private headers staged.
+  # 55003 #include private CommonCrypto headers -- cast.h, aesopt.h, opensslDES.h
+  # (available in aosm/CommonCrypto at tag mac-os-x-1068 under Source/CommonCrypto/)
+  # and CommonCryptorSPI.h (the mode-based cryptor SPI). This rewrite strips all
+  # four CommonCryptorSPI.h includes (castContext.h, desContext.h, gladmanContext.h,
+  # rc4Context.h -- see this patch's 4 removal hunts) and replaces the
+  # cast/des/rc4/gladman/Mac cipher contexts with the PUBLIC CommonCryptor.h /
+  # CommonDigest.h API, so they build against the 10.6 SDK without needing any of
+  # those private headers staged. See comp_ver apple_csp comment + Netzel's recipe
+  # for the upstream-source-of-the-other-three note.
   apply_patch apple_csp-55003-sl-backport.patch \
               "$VM/libsecurity_apple_csp-55003/lib" 4 \
               castContext.h "SL-BACKPORT"
