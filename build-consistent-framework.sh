@@ -97,15 +97,17 @@ HDRS="$PIECES/Headers $PIECES/PrivateHeaders \$(inherited)"
 # verified inert w.r.t. the AuthItemSet/SecCFObject/MachO layout skew at the time
 # (nm found no references), so this is hygiene, not an active bug fix.
 # checkpw only builds because comp_ver pins it to 55471 (PAM-based); the 1068-tag
-# 36064 needs the private DirectoryServiceMIG.h and cannot compile -- see comp_ver.
+# 36064 needs DirectoryServiceMIG.h mig-generated from aosm/DirectoryService -- a
+# step we don't do, so 36064 doesn't build from this tree as-is. See comp_ver.
 COMPS="cdsa_utilities utilities cdsa_client cssm cdsa_plugin codesigning keychain apple_x509_tp apple_x509_cl apple_file_dl apple_cspdl apple_csp sd_cspdl filedb mds ocspd pkcs12 smime cms authorization asn1 cdsa_utils manifest checkpw"
 
 # compile+stage checkpw directly for one arch.
 #
 # checkpw is the one component we cannot build through xcodebuild:
-#   - the 1068-tag 36064 needs the PRIVATE <DirectoryServiceMIG.h> (kDSStdMachPortName),
-#     which exists nowhere on the system, in the Security repos, or in the project,
-#     and there is no .defs to mig-generate it from -> 24 errors, both arches.
+#   - the 1068-tag 36064 needs <DirectoryServiceMIG.h> (kDSStdMachPortName), which
+#     is mig-generatable from aosm/DirectoryService@mac-os-x-1068 but absent from
+#     the project and the SDK -- without that mig step, 24 errors, both arches.
+#     See comp_ver checkpw comment for the full provenance.
 #   - 55471 replaced all that with PAM (pam_appl.h/openpam.h, both present on 10.6)
 #     and compiles fine, BUT its xcodeproj wants config/{lib,release}.xcconfig from
 #     the later Security tree, and those set GCC_VERSION=clang plus
