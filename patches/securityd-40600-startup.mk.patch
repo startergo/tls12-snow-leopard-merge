@@ -1,0 +1,16 @@
+--- /tmp/sd_pristine/etc/startup.mk	2013-03-23 12:42:44
++++ sources/securityd-40600/etc/startup.mk	2026-07-14 20:29:31
+@@ -37,11 +37,11 @@
+ 	cp $(SRC)/com.apple.securityd.plist $(LAUNCH_DIR)
+ 	mkdir -p $(AUTHORIZATION_LOCATION)
+ 	cp $(SRC)/authorization.plist $(AUTHORIZATION_PLIST)
+-	chown root:wheel $(AUTHORIZATION_PLIST)
++	-chown root:wheel $(AUTHORIZATION_PLIST)
+ 	chmod 644 $(AUTHORIZATION_PLIST)
+ 	mkdir -p $(VARDB)
+ 	cp $(SRC)/CodeEquivalenceCandidates $(CANDIDATES)
+-	chown root:admin $(CANDIDATES)
++	-chown root:admin $(CANDIDATES)
+ 	chmod 644 $(CANDIDATES)
+ 
+ installhdrs:

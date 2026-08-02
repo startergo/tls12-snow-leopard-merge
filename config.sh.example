@@ -1,0 +1,5 @@
+# Copy this file to config.sh and edit for your build host.
+# config.sh is git-ignored and sourced automatically when present.
+# All variables are optional; scripts fall back to inline defaults.
+
+VM_SUDO_PASS=""

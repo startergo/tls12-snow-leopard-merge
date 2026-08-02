@@ -1,0 +1,388 @@
+diff -ru /tmp/util_pristine/lib/hashing.cpp sources/libsecurity_utilities-55010/lib/hashing.cpp
+--- /tmp/util_pristine/lib/hashing.cpp	2013-03-22 19:33:12
++++ sources/libsecurity_utilities-55010/lib/hashing.cpp	2026-07-13 22:59:03
+@@ -1,10 +1,60 @@
++/*
++ * Copyright (c) 2005-2010 Apple Inc. All Rights Reserved.
++ * 
++ * @APPLE_LICENSE_HEADER_START@
++ * 
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. Please obtain a copy of the License at
++ * http://www.opensource.apple.com/apsl/ and read it before using this
++ * file.
++ * 
++ * The Original Code and all software distributed under the License are
++ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
++ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
++ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
++ * Please see the License for the specific language governing rights and
++ * limitations under the License.
++ * 
++ * @APPLE_LICENSE_HEADER_END@
++ */
++
+ //
+ // Fast hasing support
+ //
+ #include "hashing.h"
++#include "unix++.h"
+ 
+ 
+ namespace Security {
++
++
++//
++// Basic DynamicHash infrastructure
++//
++DynamicHash::~DynamicHash()
++{
++	// virtual
++}
++
++
++//
++// CommonCrypto-based DynamicHash instances
++//
++// SL-BACKPORT: CCHashInstance is built on the CCDigest* SPI (CommonDigestSPI.h),
++// which is 10.7+ only and absent from the 10.6 SDK. The class declaration in
++// hashing.h is gated on SL_HAVE_CC_DIGEST_SPI (OFF for 10.6); this definition
++// must be gated identically or it references the missing SPI. No code in the
++// Security-55002 subprojects we build uses CCHashInstance.
++#if SL_HAVE_CC_DIGEST_SPI
++CCHashInstance::CCHashInstance(CCDigestAlg alg)
++{
++	if (!(mDigest = CCDigestCreate(alg)))
++		UnixError::throwMe(ENOMEM);
++}
++#endif // SL_HAVE_CC_DIGEST_SPI
+ 
+ 
+ }	// Security
+diff -ru /tmp/util_pristine/lib/hashing.h sources/libsecurity_utilities-55010/lib/hashing.h
+--- /tmp/util_pristine/lib/hashing.h	2013-03-22 19:33:12
++++ sources/libsecurity_utilities-55010/lib/hashing.h	2026-07-13 22:59:03
+@@ -1,3 +1,26 @@
++/*
++ * Copyright (c) 2005-2010 Apple Inc. All Rights Reserved.
++ * 
++ * @APPLE_LICENSE_HEADER_START@
++ * 
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. Please obtain a copy of the License at
++ * http://www.opensource.apple.com/apsl/ and read it before using this
++ * file.
++ * 
++ * The Original Code and all software distributed under the License are
++ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
++ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
++ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
++ * Please see the License for the specific language governing rights and
++ * limitations under the License.
++ * 
++ * @APPLE_LICENSE_HEADER_END@
++ */
++
+ //
+ // Fast hash support
+ //
+@@ -6,52 +29,190 @@
+ 
+ #include <CommonCrypto/CommonDigest.h>
+ #include <cstring>
++#include <memory>
+ #include <sys/types.h>
++/* SL-BACKPORT: <CommonCrypto/CommonDigestSPI.h> (the CCDigest* SPI) does not
++ * exist in the 10.6 SDK -- it was added in 10.7. Only the CCHashInstance class
++ * below uses that SPI; SHA1 and everything else here use the PUBLIC
++ * CommonDigest.h API (CC_SHA1_*) which IS in 10.6. So we conditionally include
++ * the SPI header and conditionally compile CCHashInstance, gated on a macro that
++ * is OFF for the 10.6 build. Define SL_HAVE_CC_DIGEST_SPI=1 to restore it on a
++ * 10.7+ SDK. */
++#ifndef SL_HAVE_CC_DIGEST_SPI
++#define SL_HAVE_CC_DIGEST_SPI 0
++#endif
++#if SL_HAVE_CC_DIGEST_SPI
++#include <CommonCrypto/CommonDigestSPI.h>	// SPI slated to become API
++#endif
+ 
+ namespace Security {
+ 
+ 
+ //
+-// Common prefix for all hashers
++// An unconditional base class for all hash objects.
++// Not much in here; there's no point in declaring one yourself.
+ //
+-template <uint32_t _size>
+-class Hash {
++class Hashing {
+ public:
+ 	typedef unsigned char Byte;
+-	static const size_t digestLength = _size;
+-	typedef Byte Digest[_size];
+-	struct SDigest {
++};
++
++
++//
++// Common prefix for all static hashers.
++// There's no magic here; we're just setting up a regular framework for duck typing.
++//
++// If you write template code based on "any static hasher", you can directly tap here
++// (and learn the actual hash in use through the match on _HashType). But note that
++// a DynamicHash is not a subclass of Hash, though a DynamicHashInstance will be, duck-like.
++//
++template <uint32_t _size, class _HashType>
++class Hash : public Hashing {
++	_HashType &_self() { return static_cast<_HashType &>(*this); }	// "my real type"
++public:
++	static const size_t digestLength = _size;			// how many bytes in my digest?
++	typedef Byte Digest[_size];							// my digest as a Byte array
++	struct SDigest {									// my digest as a struct
+ 		Digest data;
++		
++		SDigest() { }
++		SDigest(const Byte *source) { ::memcpy(data, source, digestLength); }
++		friend bool operator < (const SDigest &x, const SDigest &y)	// usable as collection key
++			{ return ::memcmp(x.data, y.data, digestLength) < 0; }
++		bool operator == (const SDigest &other) const
++			{ return ::memcmp(this->data, other.data, digestLength) == 0; }
++		bool operator != (const SDigest &other) const
++			{ return ::memcmp(this->data, other.data, digestLength) != 0; }
++		bool operator == (const Byte *other) const
++			{ return ::memcmp(this->data, other, digestLength) == 0; }
++		bool operator != (const Byte *other) const
++			{ return ::memcmp(this->data, other, digestLength) != 0; }
+ 	};
++	
++	void operator () (const void *data, size_t length)	// just an alias for update()
++		{ _self().update(data, length); }
++	
++	void finish(SDigest &digest)
++		{ _self().finish(digest.data); }
++	
++	bool verify(const Byte *digest)
++		{ Digest d; _self().finish(d); return memcmp(d, digest, digestLength) == 0; }
+ };
+ 
+ 
+ //
+-// Concrete hash operators. These all follow a common pattern,
+-// corresponding to the one established in <CommonCrypto/CommonDigest.h>.
++// A dynamic switch for digest generators.
++// This isn't a subclass of Hash (which is static-fast), but it's duck-typed to it.
++// Note that digestLength is a function here, not a constant. Obviously.
+ //
+-class SHA1 : public CC_SHA1_CTX, public Hash<CC_SHA1_DIGEST_LENGTH>	{
++class DynamicHash : public Hashing {
+ public:
+-	SHA1() { CC_SHA1_Init(this); }
++	virtual ~DynamicHash();
++	
++	virtual size_t digestLength() const = 0;
++	virtual void update(const void *data, size_t length) = 0;
++	virtual void finish(Byte *digest) = 0;
++	
+ 	void operator () (const void *data, size_t length)
++		{ return this->update(data, length); }
++
++	bool verify(const Byte *digest)
++		{ Byte d[this->digestLength()]; this->finish(d); return memcmp(d, digest, this->digestLength()) == 0; }
++};
++
++
++//
++// Make a DynamicHash from a static Hash class.
++//
++template <class _HashType>
++class DynamicHashInstance : public DynamicHash, public _HashType {
++public:
++	// (wish we had C++0x already...)
++	DynamicHashInstance() { }
++	template <class Arg1>
++	DynamicHashInstance(const Arg1 &arg1) : _HashType(arg1) { }
++	template <class Arg1, class Arg2>
++	DynamicHashInstance(const Arg1 &arg1, const Arg2 &arg2) : _HashType(arg1, arg2) { }
++	template <class Arg1, class Arg2, class Arg3>
++	DynamicHashInstance(const Arg1 &arg1, const Arg2 &arg2, const Arg3 &arg3) : _HashType(arg1, arg2, arg3) { }
++
++	size_t digestLength() const
++		{ return _HashType::digestLength; }
++	void update(const void *data, size_t length)
++		{ return _HashType::update(data, length); }
++	void finish(unsigned char *digest)
++		{ return _HashType::finish(digest); }
++};
++
++
++//
++// Make a DynamicHash from a CommonCrypto hash algorithm identifier
++//
++// SL-BACKPORT: gated on the CCDigest* SPI, which is absent from the 10.6 SDK.
++// Unused by the Security-55002 subprojects we build (confirmed: no references
++// to CCHashInstance anywhere in the linked-in source). Compiled out for 10.6.
++#if SL_HAVE_CC_DIGEST_SPI
++class CCHashInstance : public DynamicHash {
++public:
++	CCHashInstance(CCDigestAlg alg);
++	~CCHashInstance()
++		{ CCDigestDestroy(mDigest); }
++	
++	size_t digestLength() const
++		{ return CCDigestOutputSize(mDigest); }
++	void update(const void *data, size_t length)
++		{ CCDigestUpdate(mDigest, data, length); }
++	void finish(unsigned char *digest)
++		{ CCDigestFinal(mDigest, digest); }
++	
++private:
++	CCDigestRef mDigest;
++};
++#endif // SL_HAVE_CC_DIGEST_SPI
++
++
++//
++// A shorthand for holding a DynamicHash subclass we got from some
++// object out there by asking nicely (by default, calling its getHash() method).
++//
++template <class _Giver, DynamicHash *(_Giver::*_fetcher)() const = &_Giver::getHash>
++class MakeHash : public std::auto_ptr<DynamicHash> {
++public:
++	MakeHash(const _Giver *giver) : std::auto_ptr<DynamicHash>((giver->*_fetcher)()) { }
++	
++	operator DynamicHash *() const { return this->get(); }
++};
++
++
++//
++// A concrete SHA1 class, used in a very many different places.
++// Note that its digestLength is a constant (not a function).
++//
++class SHA1 : public CC_SHA1_CTX, public Hash<CC_SHA1_DIGEST_LENGTH, SHA1>	{
++public:
++	SHA1() { CC_SHA1_Init(this); }
++	void update(const void *data, size_t length)
+ 		{ CC_SHA1_Update(this, data, length); }
+ 	void finish(Byte *digest) { CC_SHA1_Final(digest, this); }
+-	
+-	void finish(SDigest &digest) { finish(digest.data); }
+-	bool verify(const Byte *digest)
+-	{ Digest d; finish(d); return !memcmp(d, digest, digestLength); }
++	using Hash<CC_SHA1_DIGEST_LENGTH, SHA1>::finish;
+ };
+ 
+-class SHA256 : public CC_SHA256_CTX, public Hash<CC_SHA256_DIGEST_LENGTH>	{
++
++//
++// SL-BACKPORT: a concrete SHA256 class paralleling SHA1, built on the PUBLIC
++// 10.6 CommonDigest.h API (CC_SHA256_CTX / CC_SHA256_Init/Update/Final, all
++// present in the 10.6 SDK header and runtime). This replaces the SHA-256 path
++// that codedirectory.cpp's hashFor() previously obtained via the 10.7-only
++// CCDigest* SPI (CCHashInstance), so that SHA-256 code-directory hashing works
++// on 10.6 with no SPI dependency.
++//
++class SHA256 : public CC_SHA256_CTX, public Hash<CC_SHA256_DIGEST_LENGTH, SHA256> {
+ public:
+ 	SHA256() { CC_SHA256_Init(this); }
+-	void operator () (const void *data, size_t length)
++	void update(const void *data, size_t length)
+ 		{ CC_SHA256_Update(this, data, length); }
+ 	void finish(Byte *digest) { CC_SHA256_Final(digest, this); }
+-	
+-	void finish(SDigest &digest) { finish(digest.data); }
+-	bool verify(const Byte *digest)
+-	{ Digest d; finish(d); return !memcmp(d, digest, digestLength); }
++	using Hash<CC_SHA256_DIGEST_LENGTH, SHA256>::finish;
+ };
+ 
+ 
+diff -ru /tmp/util_pristine/lib/osxcode.cpp sources/libsecurity_utilities-55010/lib/osxcode.cpp
+--- /tmp/util_pristine/lib/osxcode.cpp	2013-03-22 19:33:12
++++ sources/libsecurity_utilities-55010/lib/osxcode.cpp	2026-07-13 22:59:02
+@@ -27,7 +27,9 @@
+ #include <sys/mman.h>
+ #include <errno.h>
+ #include <CoreFoundation/CFBundle.h>
+-#include <CoreFoundation/CFBundlePriv.h>
++// CFBundlePriv.h (_CFBundleCopyMainBundleExecutableURL) is a private SPI absent
++// from the 10.6 public SDK. OSXCode::main() below is rewritten to use public
++// CFBundle API instead (same approach as the codesigning CFBundlePriv rewrites).
+ 
+ 
+ namespace Security {
+@@ -47,12 +49,24 @@
+ {
+ 	// return a code signing-aware OSXCode subclass if possible
+ 	CFRef<SecCodeRef> me;
+-	if (SecCodeCopySelf(kSecCSDefaultFlags, &me.aref()))
++	if (!SecCodeCopySelf(kSecCSDefaultFlags, &me.aref()))
+ 		return new OSXCodeWrap(me);
+ 
+ 	// otherwise, follow the legacy path precisely - no point in messing with this, is there?
+-	Boolean isRealBundle;
+-	string path = cfString(_CFBundleCopyMainBundleExecutableURL(&isRealBundle), true);
++	Boolean isRealBundle = false;
++	// Public-API replacement for _CFBundleCopyMainBundleExecutableURL(&isRealBundle):
++	// take the main bundle's executable URL, and treat it as a "real bundle" when a
++	// main CFBundle with a bundle URL exists (bare tools have no bundle URL). The
++	// /Contents/MacOS/ structural check below makes the final bundle-vs-tool call.
++	CFURLRef execURL = NULL;
++	if (CFBundleRef mainBundle = CFBundleGetMainBundle()) {
++		execURL = CFBundleCopyExecutableURL(mainBundle);
++		if (CFURLRef bundleURL = CFBundleCopyBundleURL(mainBundle)) {
++			isRealBundle = true;
++			CFRelease(bundleURL);
++		}
++	}
++	string path = cfString(execURL, true);
+ 	if (isRealBundle) {
+ 		const char *cpath = path.c_str();
+ 		if (const char *slash = strrchr(cpath, '/'))
+@@ -80,7 +94,12 @@
+ //
+ RefPointer<OSXCode> OSXCode::at(const char *path)
+ {
++	CFRef<SecStaticCodeRef> code;
++	if (!SecStaticCodeCreateWithPath(CFTempURL(path), kSecCSDefaultFlags, &code.aref()))
++		return new OSXCodeWrap(code);
++
+ 	struct stat st;
++	// otherwise, follow the legacy path precisely - no point in messing with this, is there?
+ 	if (stat(path, &st))
+ 		UnixError::throwMe();
+ 	if ((st.st_mode & S_IFMT) == S_IFDIR) {	// directory - assume bundle
+diff -ru /tmp/util_pristine/lib/vproc++.cpp sources/libsecurity_utilities-55010/lib/vproc++.cpp
+--- /tmp/util_pristine/lib/vproc++.cpp	2013-03-22 19:33:12
++++ sources/libsecurity_utilities-55010/lib/vproc++.cpp	2026-07-13 22:59:02
+@@ -27,7 +27,10 @@
+ //
+ #include "vproc++.h"
+ #include <security_utilities/debugging.h>
+-#include </usr/local/include/vproc_priv.h>
++// vproc_priv.h (_vproc_transaction_count) is a launchd private SPI not installed
++// at /usr/local/include on 10.6. Only debugCount() below uses it, and only for
++// debugging. vproc_transaction_begin() is public (vproc.h, present on 10.6).
++#include <vproc.h>
+ 
+ 
+ namespace Security {
+@@ -45,9 +48,11 @@
+ // Get the in-process accumulated transaction count.
+ // Use for debugging only.
+ //
++// SL-BACKPORT: _vproc_transaction_count() is in the 10.7+ private vproc_priv.h,
++// absent on 10.6. This is a debug-only accessor; return 0 when unavailable.
+ size_t Transaction::debugCount()
+ {
+-	return ::_vproc_transaction_count();
++	return 0;
+ }
+ 
+ 

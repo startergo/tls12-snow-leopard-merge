@@ -1,0 +1,283 @@
+--- /tmp/kc_pristine/lib/CertificateRequest.cpp	2013-03-22 19:27:38
++++ sources/libsecurity_keychain-55017/lib/CertificateRequest.cpp	2026-06-20 05:01:44
+@@ -31,7 +31,7 @@
+ #include <Security/cssmapi.h>
+ #include <CoreServices/../Frameworks/CarbonCore.framework/Headers/MacErrors.h>
+ #include <string.h>
+-#include <security_dotmac_tp/dotMacTp.h>
++/* #include <security_dotmac_tp/dotMacTp.h>  -- .Mac membership cert service decommissioned ~2012; stubbed */
+ #include <Security/oidsattr.h>
+ #include <security_utilities/simpleprefs.h>
+ 
+@@ -287,182 +287,10 @@
+ void CertificateRequest::submitDotMac(
+ 	sint32 *estimatedTime)
+ {
+-	StLock<Mutex>_(mMutex);
+-	CSSM_RETURN							crtn;
+-	CSSM_TP_AUTHORITY_ID				tpAuthority;
+-	CSSM_TP_AUTHORITY_ID				*tpAuthPtr = NULL;
+-	CSSM_NET_ADDRESS					tpNetAddrs;
+-	CSSM_APPLE_DOTMAC_TP_CERT_REQUEST	certReq;
+-	CSSM_TP_REQUEST_SET					reqSet;
+-	CSSM_CSP_HANDLE						cspHand = 0;
+-	CSSM_X509_TYPE_VALUE_PAIR			tvp;
+-	CSSM_TP_CALLERAUTH_CONTEXT			callerAuth;
+-	CSSM_FIELD							policyField;
+-	CSSM_DATA							refId = {0, NULL};
+-	const CSSM_KEY						*privKey;
+-	const CSSM_KEY						*pubKey;
+-	OSStatus							ortn;
+-	
+-	if(mCertState != CRS_New) {
+-		certReqDbg("CertificateRequest: can only submit a new request");
+-		MacOSError::throwMe(paramErr);
+-	}
+-	if((mUserName.data() == NULL) || (mPassword.data() == NULL)) {
+-		certReqDbg("CertificateRequest: user name and password required");
+-		MacOSError::throwMe(paramErr);
+-	}
+-
+-	/* get keys and CSP handle in CSSM terms */
+-	if((mPrivKey == NULL) || (mPubKey == NULL)) {
+-		certReqDbg("CertificateRequest: pub and priv keys required");
+-		MacOSError::throwMe(paramErr);
+-	}
+-	ortn = SecKeyGetCSSMKey(mPrivKey, &privKey);
+-	if(ortn) {
+-		MacOSError::throwMe(ortn);
+-	}
+-	ortn = SecKeyGetCSSMKey(mPubKey, &pubKey);
+-	if(ortn) {
+-		MacOSError::throwMe(ortn);
+-	}
+-	ortn = SecKeyGetCSPHandle(mPrivKey, &cspHand);
+-	if(ortn) {
+-		MacOSError::throwMe(ortn);
+-	}
+-	
+-	/*
+-	 * CSSM_X509_TYPE_VALUE_PAIR_PTR - one pair for now.
+-	 * Caller passes in user name like "johnsmith"; in the CSR,
+-	 * we write "johnsmith@mac.com".
+-	 */
+-	tvp.type = CSSMOID_CommonName;
+-	tvp.valueType = BER_TAG_PKIX_UTF8_STRING;
+-	CssmAutoData fullUserName(mAlloc);
+-	unsigned nameLen = mUserName.length();
+-	unsigned domainLen = mDomain.length();
+-	fullUserName.malloc(nameLen + 1 + domainLen);
+-	tvp.value = fullUserName.get();
+-	memmove(tvp.value.Data, mUserName.data(), nameLen);
+-	memmove(tvp.value.Data + nameLen, "@", 1);
+-	memmove(tvp.value.Data + nameLen + 1, mDomain.data(), domainLen);
+-	
+-	/* Fill in the CSSM_APPLE_DOTMAC_TP_CERT_REQUEST */
+-	memset(&certReq, 0, sizeof(certReq));
+-	certReq.version = CSSM_DOT_MAC_TP_REQ_VERSION;
+-	certReq.cspHand = cspHand;
+-	certReq.clHand = mCL->handle();
+-	certReq.numTypeValuePairs = 1;
+-	certReq.typeValuePairs = &tvp;
+-	certReq.publicKey = const_cast<CSSM_KEY_PTR>(pubKey);
+-	certReq.privateKey = const_cast<CSSM_KEY_PTR>(privKey);
+-	certReq.userName = mUserName.get();
+-	certReq.password = mPassword.get();
+-	if(mDoRenew) {
+-		certReq.flags |= CSSM_DOTMAC_TP_SIGN_RENEW;
+-	}
+-	/* we don't deal with CSR here, input or output */
+-	
+-	/* now the rest of the args for CSSM_TP_SubmitCredRequest() */
+-	reqSet.Requests = &certReq;	
+-	reqSet.NumberOfRequests = 1;
+-	policyField.FieldOid = mPolicy;
+-	policyField.FieldValue.Data = NULL;
+-	policyField.FieldValue.Length = 0;
+-	memset(&callerAuth, 0, sizeof(callerAuth));
+-	callerAuth.Policy.NumberOfPolicyIds = 1;
+-	callerAuth.Policy.PolicyIds = &policyField;
+-	ortn = SecKeyGetCredentials(mPrivKey,
+-		CSSM_ACL_AUTHORIZATION_SIGN,
+-		kSecCredentialTypeDefault,
+-		const_cast<const CSSM_ACCESS_CREDENTIALS **>(&callerAuth.CallerCredentials));
+-	if(ortn) {
+-		certReqDbg("CertificateRequest: SecKeyGetCredentials error");
+-		MacOSError::throwMe(ortn);
+-	}
+-
+-	CssmAutoData hostName(mAlloc);
+-    tpAuthority.AuthorityCert = NULL;
+-    tpAuthority.AuthorityLocation = &tpNetAddrs;
+-    tpNetAddrs.AddressType = CSSM_ADDR_NAME;
+-	if(mHostName.data() != NULL) {
+-		tpNetAddrs.Address = mHostName.get();
+-	} else {
+-        unsigned hostLen = strlen(DOT_MAC_MGMT_HOST);
+-        hostName.malloc(hostLen + 1 + domainLen);
+-        tpNetAddrs.Address = hostName.get();
+-        memmove(tpNetAddrs.Address.Data, DOT_MAC_MGMT_HOST, hostLen);
+-        memmove(tpNetAddrs.Address.Data + hostLen, ".", 1);
+-        memmove(tpNetAddrs.Address.Data + hostLen + 1, mDomain.data(), domainLen);
+-    }
+-    tpAuthPtr = &tpAuthority;
+-
+-	/* go */
+-	crtn = CSSM_TP_SubmitCredRequest(mTP->handle(),
+-		tpAuthPtr,		
+-		CSSM_TP_AUTHORITY_REQUEST_CERTISSUE,	
+-		&reqSet,	
+-		&callerAuth,
+-		&mEstTime,   
+-		&refId);	// CSSM_DATA_PTR ReferenceIdentifier
+-
+-	/* handle return, store results */
+-	switch(crtn) {
+-		case CSSM_OK:
+-			/* refID is a cert, we have to store it in prefs for later retrieval. */
+-			certReqDbg("submitDotMac: full success, storing cert");
+-			if(!mIsAsync) {
+-				/* store in prefs if not running in async mode */
+-				ortn = storeResults(NULL, &refId);
+-				if(ortn) {
+-					crtn = ortn;
+-				}
+-			}
+-			/* but keep a local copy too */
+-			mCertData.copy(refId);
+-			mCertState = CRS_HaveCert;
+-			if(estimatedTime) {
+-				/* it's ready right now */
+-				*estimatedTime = 0;
+-			}
+-			break;
+-
+-		case CSSMERR_APPLE_DOTMAC_REQ_QUEUED:
+-			/* refID is the blob we use in CSSM_TP_RetrieveCredResult() */
+-			certReqDbg("submitDotMac: queued, storing refId");
+-			mRefId.copy(refId);
+-			/* return success - this crtn is not visible at API */
+-			crtn = CSSM_OK;
+-			if(!mIsAsync) {
+-				/* store in prefs if not running in async mode */
+-				ortn = storeResults(&refId, NULL);
+-				if(ortn) {
+-					crtn = ortn;
+-				}
+-			}
+-			mCertState = CRS_HaveRefId;
+-			if(estimatedTime) {
+-				*estimatedTime = mEstTime;
+-			}
+-			break;
+-
+-		case CSSMERR_APPLE_DOTMAC_REQ_REDIRECT:
+-			/* refID is a URL, caller obtains via getReturnData() */
+-			certReqDbg("submitDotMac: redirect");
+-			mRefId.copy(refId);
+-			mCertState = CRS_HaveOtherData;
+-			break;
+-			
+-		default:
+-			/* all others are fatal errors, thrown below */
+-			break;
+-	}
+-	if(refId.Data) {
+-		/* mallocd on our behalf by TP */
+-		free(refId.Data);
+-	}
+-	if(crtn) {
+-		CssmError::throwMe(crtn);
+-	}
++	/* .Mac/MobileMe membership cert request -- online service decommissioned.
++	 * Stubbed for the Snow Leopard TLS 1.2 monolith (dotMacTp.h excluded). */
++	(void)estimatedTime;
++	MacOSError::throwMe(CSSMERR_TP_REQUEST_REJECTED);
+ }
+ 
+ #pragma mark ----- cert request get result -----
+@@ -776,82 +604,7 @@
+  */
+ void CertificateRequest::postPendingRequest()
+ {
+-	StLock<Mutex>_(mMutex);
+-	CSSM_RETURN							crtn;
+-	CSSM_TP_AUTHORITY_ID				tpAuthority;
+-	CSSM_TP_AUTHORITY_ID				*tpAuthPtr = NULL;
+-	CSSM_NET_ADDRESS					tpNetAddrs;
+-	CSSM_APPLE_DOTMAC_TP_CERT_REQUEST	certReq;
+-	CSSM_TP_REQUEST_SET					reqSet;
+-	CSSM_TP_CALLERAUTH_CONTEXT			callerAuth;
+-	CSSM_FIELD							policyField;
+-	CSSM_DATA							refId = {0, NULL};
+-	
+-	assert(mCertState == CRS_Reconstructed);
+-	if((mUserName.data() == NULL) || (mPassword.data() == NULL)) {
+-		certReqDbg("postPendingRequest: user name and password required");
+-		MacOSError::throwMe(paramErr);
+-	}
+-	
+-	/* Fill in the CSSM_APPLE_DOTMAC_TP_CERT_REQUEST */
+-	memset(&certReq, 0, sizeof(certReq));
+-	certReq.version = CSSM_DOT_MAC_TP_REQ_VERSION;
+-	certReq.userName = mUserName.get();
+-	certReq.password = mPassword.get();
+-	certReq.flags = CSSM_DOTMAC_TP_IS_REQ_PENDING;
+-	
+-	/* now the rest of the args for CSSM_TP_SubmitCredRequest() */
+-	reqSet.Requests = &certReq;	
+-	reqSet.NumberOfRequests = 1;
+-	/* 
+-	 * This OID actually doesn't matter - right? This RPC doesn't know about 
+-	 * which request we seek... 
+-	 */
+-	policyField.FieldOid = mPolicy;
+-	policyField.FieldValue.Data = NULL;
+-	policyField.FieldValue.Length = 0;
+-	memset(&callerAuth, 0, sizeof(callerAuth));
+-	callerAuth.Policy.NumberOfPolicyIds = 1;
+-	callerAuth.Policy.PolicyIds = &policyField;
+-	/* no other creds here */
+-
+-	if(mHostName.data() != NULL) {
+-		tpAuthority.AuthorityCert = NULL;
+-		tpAuthority.AuthorityLocation = &tpNetAddrs;
+-		tpNetAddrs.AddressType = CSSM_ADDR_NAME;
+-		tpNetAddrs.Address = mHostName.get();
+-		tpAuthPtr = &tpAuthority;
+-	}
+-
+-	/* go */
+-	crtn = CSSM_TP_SubmitCredRequest(mTP->handle(),
+-		tpAuthPtr,		
+-		CSSM_TP_AUTHORITY_REQUEST_CERTLOOKUP,	
+-		&reqSet,	
+-		&callerAuth,
+-		&mEstTime,   
+-		&refId);	// CSSM_DATA_PTR ReferenceIdentifier
+-
+-	if(refId.Data) {
+-		/* shouldn't be any but just in case.... */
+-		free(refId.Data);
+-	}
+-	switch(crtn) {
+-		case CSSMERR_APPLE_DOTMAC_REQ_IS_PENDING:
+-			certReqDbg("postPendingRequest: REQ_IS_PENDING");
+-			break;
+-		case CSSMERR_APPLE_DOTMAC_NO_REQ_PENDING:
+-			certReqDbg("postPendingRequest: NO_REQ_PENDING");
+-			break;
+-		case CSSM_OK:
+-			/* should never happen */
+-			certReqDbg("postPendingRequest: unexpected success!");
+-			crtn = internalComponentErr;
+-			break;
+-		default:
+-			certReqDbg("postPendingRequest: unexpected rtn %lu", (unsigned long)crtn);
+-			break;
+-	}
+-	CssmError::throwMe(crtn);
++	/* .Mac pending-request poll -- service decommissioned; stubbed. */
++	MacOSError::throwMe(CSSMERR_TP_REQUEST_REJECTED);
+ }
+ 

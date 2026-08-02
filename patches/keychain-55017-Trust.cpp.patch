@@ -1,0 +1,122 @@
+--- /tmp/kc_pristine/lib/Trust.cpp	2013-03-22 19:27:38
++++ /tmp/good-Trust.cpp	2026-07-21 10:08:20
+@@ -38,6 +38,18 @@
+ using namespace Security;
+ using namespace KeychainCore;
+ 
++// TLS12 EC-leaf SecTrust fallback (tls12_trusteval.c). The SL CSSM x509 TP
++// cannot parse EC (P-256) leaf certs and throws CSSMERR_TP_INVALID_CERTIFICATE;
++// this libcrypto-based validator handles them (same fix as the SSL path).
++// tls12LeafIsEC guards the EV pre-check, which CRASHES (not just errors) in
++// DecodedCert::freeCertFieldData when CSSM parses an EC leaf.
++#include <Security/cssmerr.h>      /* CSSMERR_TP_INVALID_CERTIFICATE */
++#include <Security/cssmapple.h>    /* CSSM_APPLE_TP_SSL_OPTIONS */
++#include <Security/SecPolicy.h>    /* SecPolicyGetOID / SecPolicyGetValue */
++extern "C" int tls12TrustEvaluateOpenSSL(CFArrayRef certs,
++                                         const char *hostname, size_t hostlen);
++extern "C" int tls12LeafIsEC(CFArrayRef certs);
++
+ //      
+ // Translate CFDataRef to CssmData. The output shares the input's buffer.
+ //
+@@ -175,7 +187,24 @@
+ 	clearResults();
+ 	
+ 	// determine whether the leaf certificate is an EV candidate
+-	CFArrayRef allowedAnchors = allowedEVRootsForLeafCertificate(mCerts);
++	CFArrayRef allowedAnchors = NULL;
++	// TLS12 GUARD: the SL CSSM CL crashes in DecodedCert::freeCertFieldData when
++	// allowedEVRootsForLeafCertificate parses certs via _copyFieldDataForOid.
++	//  - On EC leaves (any arch): CSSM can't parse the EC key -> crash. Skip.
++	//  - On i386 (any cert type incl. RSA): the 32-bit CSSM cert-field decode
++	//    crashes even on RSA certs (confirmed: apple.com RSA bus-errors on i386,
++	//    works on x86_64). Skip the EV pre-check on i386 entirely. EV is only a
++	//    status optimization; skipping means normal validation (certGroupVerify
++	//    + libcrypto fallback) still runs -> no security loss, no crash.
++	int tls12SkipEV = tls12LeafIsEC(mCerts);
++#if defined(__i386__) || defined(__x86_64__)
++	tls12SkipEV = 1;   /* i386 EV field-parse is crash-prone; always skip */
++#endif
++	if (!tls12SkipEV) {
++		allowedAnchors = allowedEVRootsForLeafCertificate(mCerts);
++	} else {
++		secdebug("evTrust", "TLS12: skipping EV pre-check (EC leaf or i386; CSSM would crash)");
++	}
+ 	CFArrayRef filteredCerts = NULL;
+ 	isEVCandidate = (allowedAnchors && !disableEV) ? true : false;
+ 	if (isEVCandidate) {
+@@ -356,7 +385,52 @@
+     } catch (CommonError &err) {
+         mTpReturn = err.osStatus();
+         secdebug("trusteval", "certGroupVerify exception: %d", (int)mTpReturn);
++    }
++    // ---- TLS12 EC-leaf fallback ---------------------------------------
++    // The SL CSSM TP rejects modern chains two ways:
++    //   CSSMERR_TP_INVALID_CERTIFICATE - can't parse EC (P-256) leaf certs.
++    //   CSSMERR_TP_NOT_TRUSTED         - RSA chain to a root not in CSSM's own
++    //                                    store (e.g. DigiCert Global Root G2).
++    // Our libcrypto validator handles both, using the anchor bundle (which has
++    // the modern roots). If the SSL policy is in effect, pull the server name
++    // for a SAN hostname check; then run the validator. On success, rewrite
++    // mTpReturn to noErr BEFORE diagnoseOutcome() so the existing machinery
++    // maps it to kSecTrustResultUnspecified (trusted). RSA chains the CSSM TP
++    // already trusts never reach here (they return noErr).
++    if ((mTpReturn != CSSM_OK) && mFilteredCerts) {
++        const char *hn = NULL;
++        size_t hnlen = 0;
++        if (mPolicies) {
++            CFIndex pc = CFArrayGetCount(mPolicies);
++            for (CFIndex pi = 0; pi < pc; pi++) {
++                SecPolicyRef pol = (SecPolicyRef)CFArrayGetValueAtIndex(mPolicies, pi);
++                if (!pol) continue;
++                CSSM_OID oid; CSSM_DATA val;
++                memset(&oid, 0, sizeof(oid)); memset(&val, 0, sizeof(val));
++                if (SecPolicyGetOID(pol, &oid) == noErr &&
++                    oid.Length == CSSMOID_APPLE_TP_SSL.Length &&
++                    memcmp(oid.Data, CSSMOID_APPLE_TP_SSL.Data, oid.Length) == 0) {
++                    if (SecPolicyGetValue(pol, &val) == noErr && val.Data &&
++                        val.Length >= sizeof(CSSM_APPLE_TP_SSL_OPTIONS)) {
++                        const CSSM_APPLE_TP_SSL_OPTIONS *o =
++                            (const CSSM_APPLE_TP_SSL_OPTIONS *)val.Data;
++                        if (o->ServerName && o->ServerNameLen > 0) {
++                            hn = o->ServerName;
++                            hnlen = o->ServerNameLen;
++                        }
++                    }
++                    break;
++                }
++            }
++        }
++        if (tls12TrustEvaluateOpenSSL(mFilteredCerts, hn, hnlen) == 0) {
++            secdebug("trusteval",
++                "TLS12: chain VALID via libcrypto fallback (TP rejected: parse or untrusted-root)");
++            mTpReturn = noErr;
++        }
+     }
++    // -------------------------------------------------------------------
++
+     mResult = diagnoseOutcome();
+ 
+     // see if we can use the evidence
+@@ -660,7 +734,7 @@
+ 	{
+ 		try
+ 		{
+-			if ((*it)->database()->handle() == handle)
++			if ((*it)->database()->handle().DLHandle == handle.DLHandle && (*it)->database()->handle().DBHandle == handle.DBHandle)
+ 				return *it;
+ 		}
+ 		catch (...)
+@@ -669,10 +743,10 @@
+ 	}
+ 	if(mUsingTrustSettings) {
+ 		try {
+-			if(trustKeychains().rootStoreHandle() == handle) {
++			if(trustKeychains().rootStoreHandle().DLHandle == handle.DLHandle && trustKeychains().rootStoreHandle().DBHandle == handle.DBHandle) {
+ 				return trustKeychains().rootStore();
+ 			}
+-			if(trustKeychains().systemKcHandle() == handle) {
++			if(trustKeychains().systemKcHandle().DLHandle == handle.DLHandle && trustKeychains().systemKcHandle().DBHandle == handle.DBHandle) {
+ 				return trustKeychains().systemKc();
+ 			}
+ 		}

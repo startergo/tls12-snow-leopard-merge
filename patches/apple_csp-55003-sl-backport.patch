@@ -1,0 +1,367 @@
+diff -ru /tmp/csp_pristine/lib/AppleCSP.cpp sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/AppleCSP.cpp
+--- /tmp/csp_pristine/lib/AppleCSP.cpp	2013-03-22 19:18:46
++++ sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/AppleCSP.cpp	2026-07-02 20:20:10
+@@ -26,6 +26,7 @@
+ #include "cspdebugging.h" 
+ #include <security_cdsa_plugin/CSPsession.h>
+ #include <security_utilities/alloc.h>
++#include <security_utilities/logging.h>	// Syslog (TLS12DBG instrumentation)
+ #ifdef	BSAFE_CSP_ENABLE
+ #include "bsafecsp.h"
+ #include "bsafecspi.h"
+@@ -215,6 +216,24 @@
+ 		return;
+ 	}
+ 	dprintf0("AppleCSPSession::setupContext: invalid algorithm\n");
++	{
++		// TLS12DBG: capture caller return addresses to identify WHO misroutes a
++		// KEYCHAIN_KEY (0x80000008) op to the base AppleCSP instead of the SD-CSPDL
++		// session. Symbolicate the printed addresses later with:
++		//   atos -o <Security binary> -l <slide> <addr...>
++		void *ra0 = __builtin_return_address(0);
++		void *ra1 = (void*)0; void *ra2 = (void*)0; void *ra3 = (void*)0;
++		#if defined(__x86_64__)
++		// guard deeper frames; may be unavailable at top of stack
++		ra1 = __builtin_return_address(1);
++		ra2 = __builtin_return_address(2);
++		ra3 = __builtin_return_address(3);
++		#endif
++		Syslog::alert("TLS12DBG CSP setupContext INVALID_ALGORITHM: algClass(type)=%u algorithm=%u",
++			(unsigned)context.type(), (unsigned)context.algorithm());
++		Syslog::alert("TLS12DBG CSP throw callers: %p %p %p %p",
++			ra0, ra1, ra2, ra3);
++	}
+ 	CssmError::throwMe(CSSMERR_CSP_INVALID_ALGORITHM);
+ }
+ 
+diff -ru /tmp/csp_pristine/lib/castContext.cpp sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/castContext.cpp
+--- /tmp/csp_pristine/lib/castContext.cpp	2013-03-22 19:18:46
++++ sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/castContext.cpp	2026-06-19 22:49:38
+@@ -28,7 +28,8 @@
+     BlockCryptor(session),
+     mInitFlag(false),
+     mCastKey(NULL),
+-    mRawKeySize(0)
++    mRawKeySize(0),
++    mLastEncrypting(false)
+ {
+ }
+ 
+@@ -82,9 +83,22 @@
+ 		deleteKey();
+ 	}
+ 
+-	/* init key only if key size or key bits have changed */
+-	if(!sameKeySize || memcmp(mRawKey, keyData, mRawKeySize)) {
+-        (void) CCCryptorCreateWithMode(0, kCCModeECB, kCCAlgorithmCAST, ccDefaultPadding, NULL, keyData, keyLen, NULL, 0, 0, 0, &mCastKey);
++	/* init key only if key size or key bits OR direction have changed.
++	 * SL-BACKPORT: direction is now part of the re-create condition because the
++	 * public CCCryptorCreate binds encrypt/decrypt at create time (the old mode SPI
++	 * was direction-agnostic). mCastKey==NULL also forces (re)create. */
++	if(!sameKeySize || (mCastKey == NULL) || (mLastEncrypting != encrypting) ||
++	   memcmp(mRawKey, keyData, mRawKeySize)) {
++        if(mCastKey != NULL) {
++            CCCryptorRelease(mCastKey);
++            mCastKey = NULL;
++        }
++        /* SL-BACKPORT: CCCryptorCreateWithMode (10.7 SPI) -> public CCCryptorCreate
++         * with kCCOptionECBMode; BlockCryptor handles chaining. CAST is variable key
++         * length (keyLen), passed straight through. */
++        (void) CCCryptorCreate(encrypting ? kCCEncrypt : kCCDecrypt, kCCAlgorithmCAST,
++            kCCOptionECBMode, keyData, keyLen, NULL, &mCastKey);
++        mLastEncrypting = encrypting;
+ 	
+ 		/* save this raw key data */
+ 		memmove(mRawKey, keyData, keyLen); 
+@@ -112,7 +126,12 @@
+ 	if(cipherTextLen < kCCBlockSizeCAST) {
+ 		CssmError::throwMe(CSSMERR_CSP_OUTPUT_LENGTH_ERROR);
+ 	}
+-    (void) CCCryptorEncryptDataBlock(mCastKey, NULL, plainText, kCCBlockSizeCAST, cipherText);
++    /* SL-BACKPORT: CCCryptorEncryptDataBlock (10.7 SPI) -> public CCCryptorUpdate. */
++    {
++        size_t dataOutMoved = 0;
++        (void) CCCryptorUpdate(mCastKey, plainText, kCCBlockSizeCAST,
++            cipherText, kCCBlockSizeCAST, &dataOutMoved);
++    }
+ 
+ 	cipherTextLen = kCCBlockSizeCAST;
+ }
+@@ -127,7 +146,12 @@
+ 	if(plainTextLen < kCCBlockSizeCAST) {
+ 		CssmError::throwMe(CSSMERR_CSP_OUTPUT_LENGTH_ERROR);
+ 	}
+-    (void) CCCryptorDecryptDataBlock(mCastKey, NULL, cipherText, kCCBlockSizeCAST, plainText);
++    /* SL-BACKPORT: CCCryptorDecryptDataBlock (10.7 SPI) -> public CCCryptorUpdate. */
++    {
++        size_t dataOutMoved = 0;
++        (void) CCCryptorUpdate(mCastKey, cipherText, kCCBlockSizeCAST,
++            plainText, kCCBlockSizeCAST, &dataOutMoved);
++    }
+ 
+ 	plainTextLen = kCCBlockSizeCAST;
+ }
+diff -ru /tmp/csp_pristine/lib/castContext.h sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/castContext.h
+--- /tmp/csp_pristine/lib/castContext.h	2013-03-22 19:18:46
++++ sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/castContext.h	2026-06-19 22:49:38
+@@ -42,7 +42,9 @@
+ #include "BlockCryptor.h"
+ #include <CoreServices/../Frameworks/CarbonCore.framework/Headers/MacTypes.h>
+ #include <CommonCrypto/CommonCryptor.h>
+-#include "/usr/local/include/CommonCrypto/CommonCryptorSPI.h"
++/* SL-BACKPORT: removed #include "/usr/local/include/CommonCrypto/CommonCryptorSPI.h"
++ * (10.7 mode-based cryptor SPI, absent from 10.6). castContext.cpp now uses the
++ * public CommonCryptor.h API (CCCryptorCreate + kCCOptionECBMode/CCCryptorUpdate). */
+ 
+ class CastContext : public BlockCryptor {
+ public:
+@@ -86,6 +88,10 @@
+ 	 */
+ 	uint8				mRawKey[kCCKeySizeMaxCAST];
+ 	uint32				mRawKeySize;
++	/* SL-BACKPORT: the public CCCryptorCreate fixes direction at create time (unlike
++	 * the old direction-agnostic mode SPI). Track the last direction so the key-init
++	 * branch also re-creates the cryptor when the direction changes, not just the key. */
++	bool				mLastEncrypting;
+ 
+ 	
+ };	/* CastContext */
+diff -ru /tmp/csp_pristine/lib/desContext.cpp sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/desContext.cpp
+--- /tmp/csp_pristine/lib/desContext.cpp	2013-03-22 19:18:46
++++ sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/desContext.cpp	2026-06-19 22:45:53
+@@ -68,7 +68,15 @@
+         CCCryptorRelease(DesInst);
+     }
+     
+-    (void) CCCryptorCreateWithMode(0, kCCModeECB, kCCAlgorithmDES, ccDefaultPadding, NULL, keyData, kCCKeySizeDES, NULL, 0, 0, 0, &DesInst);
++    /* SL-BACKPORT: was CCCryptorCreateWithMode(0,kCCModeECB,...) — a 10.7 SPI absent
++     * from 10.6. BlockCryptor handles chaining/padding/IV itself and uses this as a
++     * raw single-block ECB primitive, so the public 10.6 CCCryptorCreate with
++     * kCCOptionECBMode (no padding) is the exact equivalent. The mode-based SPI is
++     * direction-agnostic (op chosen per *DataBlock call); the public API fixes the
++     * direction at create time, so we pass encrypting?kCCEncrypt:kCCDecrypt — correct
++     * because BlockCryptor calls init() fresh for each en/decrypt operation. */
++    (void) CCCryptorCreate(encrypting ? kCCEncrypt : kCCDecrypt, kCCAlgorithmDES,
++        kCCOptionECBMode, keyData, kCCKeySizeDES, NULL, &DesInst);
+ 
+ 	/* Finally, have BlockCryptor do its setup */
+ 	setup(DES_BLOCK_SIZE_BYTES, context);
+@@ -91,7 +99,13 @@
+ 	if(cipherTextLen < DES_BLOCK_SIZE_BYTES) {
+ 		CssmError::throwMe(CSSMERR_CSP_OUTPUT_LENGTH_ERROR);
+ 	}
+-    (void) CCCryptorEncryptDataBlock(DesInst, NULL, plainText, DES_BLOCK_SIZE_BYTES, cipherText);
++    /* SL-BACKPORT: CCCryptorEncryptDataBlock (10.7 SPI) -> public CCCryptorUpdate.
++     * One ECB block in, one block out, no padding; dataOutMoved is the block size. */
++    {
++        size_t dataOutMoved = 0;
++        (void) CCCryptorUpdate(DesInst, plainText, DES_BLOCK_SIZE_BYTES,
++            cipherText, DES_BLOCK_SIZE_BYTES, &dataOutMoved);
++    }
+ 	cipherTextLen = DES_BLOCK_SIZE_BYTES;
+ }
+ 
+@@ -109,7 +123,13 @@
+ 		/* little optimization for callers who want to decrypt in place */
+ 		memmove(plainText, cipherText, DES_BLOCK_SIZE_BYTES);
+ 	}
+-    (void) CCCryptorDecryptDataBlock(DesInst, NULL, cipherText, DES_BLOCK_SIZE_BYTES, plainText);
++    /* SL-BACKPORT: CCCryptorDecryptDataBlock (10.7 SPI) -> public CCCryptorUpdate.
++     * The cryptor was created with kCCDecrypt in init(), so Update decrypts. */
++    {
++        size_t dataOutMoved = 0;
++        (void) CCCryptorUpdate(DesInst, cipherText, DES_BLOCK_SIZE_BYTES,
++            plainText, DES_BLOCK_SIZE_BYTES, &dataOutMoved);
++    }
+ 	plainTextLen = DES_BLOCK_SIZE_BYTES;
+ }
+ 
+@@ -155,7 +175,12 @@
+         CCCryptorRelease(DesInst);
+     }
+     
+-    (void) CCCryptorCreateWithMode(0, kCCModeECB, kCCAlgorithm3DES, ccDefaultPadding, NULL, keyData, kCCKeySize3DES, NULL, 0, 0, 0, &DesInst);
++    /* SL-BACKPORT: CCCryptorCreateWithMode (10.7 SPI) -> public CCCryptorCreate with
++     * kCCOptionECBMode. 3DES single-block ECB primitive; BlockCryptor does chaining.
++     * Direction fixed at create from the encrypting flag (init() runs per operation).
++     * 3DES key-wrapping is used by the keychain, so this path must stay correct. */
++    (void) CCCryptorCreate(encrypting ? kCCEncrypt : kCCDecrypt, kCCAlgorithm3DES,
++        kCCOptionECBMode, keyData, kCCKeySize3DES, NULL, &DesInst);
+ 
+ 	/* Finally, have BlockCryptor do its setup */
+ 	setup(DES3_BLOCK_SIZE_BYTES, context);
+@@ -178,7 +203,12 @@
+ 	if(cipherTextLen < DES3_BLOCK_SIZE_BYTES) {
+ 		CssmError::throwMe(CSSMERR_CSP_OUTPUT_LENGTH_ERROR);
+ 	}
+-    (void) CCCryptorEncryptDataBlock(DesInst, NULL, plainText, DES3_BLOCK_SIZE_BYTES, cipherText);
++    /* SL-BACKPORT: CCCryptorEncryptDataBlock (10.7 SPI) -> public CCCryptorUpdate. */
++    {
++        size_t dataOutMoved = 0;
++        (void) CCCryptorUpdate(DesInst, plainText, DES3_BLOCK_SIZE_BYTES,
++            cipherText, DES3_BLOCK_SIZE_BYTES, &dataOutMoved);
++    }
+ 	cipherTextLen = DES3_BLOCK_SIZE_BYTES;
+ }
+ 
+@@ -192,6 +222,11 @@
+ 	if(plainTextLen < DES3_BLOCK_SIZE_BYTES) {
+ 		CssmError::throwMe(CSSMERR_CSP_OUTPUT_LENGTH_ERROR);
+ 	}
+-    (void) CCCryptorDecryptDataBlock(DesInst, NULL, cipherText, DES3_BLOCK_SIZE_BYTES, plainText);
++    /* SL-BACKPORT: CCCryptorDecryptDataBlock (10.7 SPI) -> public CCCryptorUpdate. */
++    {
++        size_t dataOutMoved = 0;
++        (void) CCCryptorUpdate(DesInst, cipherText, DES3_BLOCK_SIZE_BYTES,
++            plainText, DES3_BLOCK_SIZE_BYTES, &dataOutMoved);
++    }
+ 	plainTextLen = DES3_BLOCK_SIZE_BYTES;
+ }
+diff -ru /tmp/csp_pristine/lib/desContext.h sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/desContext.h
+--- /tmp/csp_pristine/lib/desContext.h	2013-03-22 19:18:46
++++ sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/desContext.h	2026-06-19 22:45:54
+@@ -29,7 +29,9 @@
+ #include "AppleCSPSession.h"
+ #include "BlockCryptor.h"
+ #include <CommonCrypto/CommonCryptor.h>
+-#include "/usr/local/include/CommonCrypto/CommonCryptorSPI.h"
++/* SL-BACKPORT: removed #include "/usr/local/include/CommonCrypto/CommonCryptorSPI.h"
++ * (the 10.7 mode-based cryptor SPI, absent from 10.6). desContext.cpp now uses only
++ * the public CommonCryptor.h API (CCCryptorCreate + kCCOptionECBMode/CCCryptorUpdate). */
+ 
+ #define DES_KEY_SIZE_BITS_EXTERNAL		(kCCKeySizeDES * 8)
+ #define DES_BLOCK_SIZE_BYTES			kCCBlockSizeDES
+diff -ru /tmp/csp_pristine/lib/gladmanContext.cpp sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/gladmanContext.cpp
+--- /tmp/csp_pristine/lib/gladmanContext.cpp	2013-03-22 19:18:46
++++ sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/gladmanContext.cpp	2026-06-19 22:49:38
+@@ -105,7 +105,16 @@
+ 	 */
+ 	if(!sameKeySize || (mWasEncrypting != encrypting) ||
+ 		memcmp(mRawKey, keyData, mRawKeySize)) {
+-        (void) CCCryptorCreateWithMode(0, kCCModeECB, kCCAlgorithmAES128, ccDefaultPadding, NULL, keyData, keyLen, NULL, 0, 0, 0, &mAesKey);
++        if(mAesKey != NULL) {
++            CCCryptorRelease(mAesKey);
++            mAesKey = NULL;
++        }
++        /* SL-BACKPORT: CCCryptorCreateWithMode (10.7 SPI) -> public CCCryptorCreate
++         * with kCCOptionECBMode. BlockCryptor handles CBC/IV itself. AES uses one
++         * algorithm constant (kCCAlgorithmAES128) for all key sizes; keyLen selects
++         * 128/192/256. Direction is already tracked via mWasEncrypting. */
++        (void) CCCryptorCreate(encrypting ? kCCEncrypt : kCCDecrypt, kCCAlgorithmAES128,
++            kCCOptionECBMode, keyData, keyLen, NULL, &mAesKey);
+ 
+ 		/* save this raw key data */
+ 		memmove(mRawKey, keyData, keyLen); 
+@@ -152,7 +161,12 @@
+ 	if(cipherTextLen < plainTextLen) {
+ 		CssmError::throwMe(CSSMERR_CSP_OUTPUT_LENGTH_ERROR);
+ 	}
+-    (void) CCCryptorEncryptDataBlock(mAesKey, NULL, plainText, plainTextLen, cipherText);
++    /* SL-BACKPORT: CCCryptorEncryptDataBlock (10.7 SPI) -> public CCCryptorUpdate. */
++    {
++        size_t dataOutMoved = 0;
++        (void) CCCryptorUpdate(mAesKey, plainText, plainTextLen,
++            cipherText, cipherTextLen, &dataOutMoved);
++    }
+ 
+ 	cipherTextLen = plainTextLen;
+ }
+@@ -167,7 +181,12 @@
+ 	if(plainTextLen < cipherTextLen) {
+ 		CssmError::throwMe(CSSMERR_CSP_OUTPUT_LENGTH_ERROR);
+ 	}
+-    (void) CCCryptorDecryptDataBlock(mAesKey, NULL, cipherText, cipherTextLen, plainText);
++    /* SL-BACKPORT: CCCryptorDecryptDataBlock (10.7 SPI) -> public CCCryptorUpdate. */
++    {
++        size_t dataOutMoved = 0;
++        (void) CCCryptorUpdate(mAesKey, cipherText, cipherTextLen,
++            plainText, plainTextLen, &dataOutMoved);
++    }
+ 	plainTextLen = cipherTextLen;
+ }
+ 
+diff -ru /tmp/csp_pristine/lib/gladmanContext.h sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/gladmanContext.h
+--- /tmp/csp_pristine/lib/gladmanContext.h	2013-03-22 19:18:46
++++ sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/gladmanContext.h	2026-06-19 22:49:38
+@@ -28,7 +28,9 @@
+ #include "AppleCSPSession.h"
+ #include "BlockCryptor.h"
+ #include <CommonCrypto/CommonCryptor.h>
+-#include "/usr/local/include/CommonCrypto/CommonCryptorSPI.h"
++/* SL-BACKPORT: removed #include "/usr/local/include/CommonCrypto/CommonCryptorSPI.h"
++ * (10.7 mode-based cryptor SPI, absent from 10.6). gladmanContext.cpp now uses the
++ * public CommonCryptor.h API (CCCryptorCreate + kCCOptionECBMode/CCCryptorUpdate). */
+ #include "aesCommon.h"
+ 
+ #define GLADMAN_BLOCK_SIZE_BYTES	DEFAULT_AES_BLOCK_BYTES
+diff -ru /tmp/csp_pristine/lib/miscAlgFactory.cpp sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/miscAlgFactory.cpp
+--- /tmp/csp_pristine/lib/miscAlgFactory.cpp	2013-03-22 19:18:46
++++ sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/miscAlgFactory.cpp	2026-07-02 20:29:16
+@@ -359,6 +359,35 @@
+ 						cspCtx = new MacLegacyContext(session, alg);
+ 					}
+ 					return true;
++				#else
++				/*
++				 * SNOW LEOPARD (10.6.8) FIX: CSSM_ALGID_SHA1HMAC_LEGACY
++				 * (0x80000008) is the "bug-for-bug legacy" HMAC-SHA1 that
++				 * securityd uses to sign/verify keychain database blobs
++				 * (dbcrypto.cpp encodeCore/decodeCore). Its dedicated handler,
++				 * MacLegacyContext, depends on CryptKit's HmacSha1Legacy and is
++				 * compiled only under CRYPTKIT_CSP_ENABLE. In this monolith that
++				 * legacy HMAC object is not available at runtime, so the case
++				 * fell through to CSSMERR_CSP_INVALID_ALGORITHM -- which broke ALL
++				 * keychain creation/unlock (systemkeychain, login.keychain,
++				 * "always trust" persistence) even though TLS was unaffected
++				 * (TLS never uses the legacy HMAC).
++				 *
++				 * The legacy quirk only differs from standard HMAC-SHA1 when the
++				 * key is LONGER than the HMAC block size (64 bytes): legacy omits
++				 * the RFC-2104 key-folding step. Keychain blob signing keys are
++				 * 20 bytes (SHA1 digest size, see DbBlob::PrivateBlob::SigningKey),
++				 * well under the block size, so standard and legacy HMAC-SHA1
++				 * produce byte-identical results for this use. We therefore route
++				 * SHA1HMAC_LEGACY to the always-available standard MacContext,
++				 * computing HMAC-SHA1. This makes keychains work without pulling
++				 * in the CryptKit legacy dependency.
++				 */
++				case CSSM_ALGID_SHA1HMAC_LEGACY:
++					if(cspCtx == NULL) {
++						cspCtx = new MacContext(session, CSSM_ALGID_SHA1HMAC);
++					}
++					return true;
+ 				#endif
+ 				default:
+ 					/* not our mac alg */
+diff -ru /tmp/csp_pristine/lib/rc4Context.cpp sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/rc4Context.cpp
+--- /tmp/csp_pristine/lib/rc4Context.cpp	2013-03-22 19:18:46
++++ sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/rc4Context.cpp	2026-06-19 22:49:39
+@@ -52,7 +52,13 @@
+ 	
+ 	/* All other context attributes ignored */
+ 	/* init the low-level state */
+-    (void) CCCryptorCreateWithMode(0, kCCModeRC4, kCCAlgorithmRC4, ccDefaultPadding, NULL, keyData, keyLen, NULL, 0, 0, 0, &rc4Key);
++    /* SL-BACKPORT: CCCryptorCreateWithMode(0,kCCModeRC4,...) (10.7 SPI) -> public
++     * CCCryptorCreate. RC4 is a stream cipher: no block mode option (pass 0, not
++     * kCCOptionECBMode). The keystream is identical for encrypt/decrypt (XOR), so
++     * direction is immaterial to output, but the public API requires an op; pass the
++     * actual direction. update() already uses the public CCCryptorUpdate. */
++    (void) CCCryptorCreate(encrypting ? kCCEncrypt : kCCDecrypt, kCCAlgorithmRC4,
++        0, keyData, keyLen, NULL, &rc4Key);
+ 
+ }	
+ 
+diff -ru /tmp/csp_pristine/lib/rc4Context.h sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/rc4Context.h
+--- /tmp/csp_pristine/lib/rc4Context.h	2013-03-22 19:18:46
++++ sources/libsecurity_apple_csp-libsecurity_apple_csp-55003/lib/rc4Context.h	2026-06-19 22:49:39
+@@ -26,7 +26,9 @@
+ #include "AppleCSPContext.h"
+ #include <CoreServices/../Frameworks/CarbonCore.framework/Headers/MacTypes.h>
+ #include <CommonCrypto/CommonCryptor.h>
+-#include "/usr/local/include/CommonCrypto/CommonCryptorSPI.h"
++/* SL-BACKPORT: removed #include "/usr/local/include/CommonCrypto/CommonCryptorSPI.h"
++ * (10.7 mode-based cryptor SPI, absent from 10.6). rc4Context.cpp now uses the public
++ * CommonCryptor.h API (CCCryptorCreate; CCCryptorUpdate was already public). */
+ 
+ class RC4Context : public AppleCSPContext {
+ public:
