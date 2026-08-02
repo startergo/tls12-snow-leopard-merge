@@ -987,7 +987,7 @@ if [ "$STAGE" = "all" ] || [ "$STAGE" = "components" ]; then
   # (available in aosm/CommonCrypto at tag mac-os-x-1068 under Source/CommonCrypto/)
   # and CommonCryptorSPI.h (the mode-based cryptor SPI). This rewrite strips all
   # four CommonCryptorSPI.h includes (castContext.h, desContext.h, gladmanContext.h,
-  # rc4Context.h -- see this patch's 4 removal hunts) and replaces the
+  # rc4Context.h -- see this patch's 4 removal hunks) and replaces the
   # cast/des/rc4/gladman/Mac cipher contexts with the PUBLIC CommonCryptor.h /
   # CommonDigest.h API, so they build against the 10.6 SDK without needing any of
   # those private headers staged. See comp_ver apple_csp comment + Netzel's recipe
