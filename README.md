@@ -97,6 +97,13 @@ sl-compat-prefix.h                Compat prefix force-included into every compil
 ssltest.c, ssltest_multi.c        TLS test programs (link -framework Security)
 ```
 
+> **Provenance pin set:** the exact upstream commit each vendored tree above
+> was taken from is recorded in
+> [`apple-security-mac-os-x-1068`](https://github.com/startergo/apple-security-mac-os-x-1068)
+> — a parallel repository of 30 git submodules (29 pinned to `aosm/*` + 1 to
+> `startergo/libsecurity_checkpw` for the reconstructed 55471). Reference
+> artifact for audit and future OS backports; not consumed by this build.
+
 ### Trust anchors
 
 The root certificates the rebuilt trust path validates against ship in-tree at
@@ -107,14 +114,22 @@ current certificate chains works out of the box.
 ### Component versions
 
 The build uses the Apple **`mac-os-x-1068`** (10.6.8) component set with three
-deliberate exceptions, each because the `1068` tag needs a private header Apple
-never published while a later version was adapted to public APIs:
+deliberate exceptions, in two distinct shapes:
+
+- **Private-header exceptions (`apple_csp`, `checkpw`)**: the 1068 tag needs a
+  private header that's not in the 10.6 SDK or in the component's own tree, but
+  IS available in a companion Apple open-source repo. The non-1068 version is
+  kept for what lives on it (not because the 1068 tag is impossible to build):
+  `apple_csp-55003` hosts the SL backport + legacy-HMAC; `checkpw-55471` is
+  Apple's PAM rewrite. See VERSION-DISCOVERY.md for the full rationale.
+- **Patch-carrying exception (`ssl`)**: the 1068 tag builds clean; `ssl-55002`
+  is kept because it carries this project's TLS 1.2 + AES-GCM patches.
 
 | component   | version | why not the 1068 tag |
 |-------------|---------|----------------------|
-| `ssl`       | 55002   | carries the TLS 1.2 + AES-GCM patches (1068 tag is 40581) |
-| `apple_csp` | 55003   | SL backport onto public CommonCrypto API + legacy-HMAC (1068 tag 36859 needs private CommonCrypto headers) |
-| `checkpw`   | 55471   | 1068 tag 36064 needs a private DirectoryService MIG header; 55471 uses PAM, identical exports |
+| `ssl`       | 55002   | patch-carrying: hosts TLS 1.2 + AES-GCM patches (1068 tag 40581 builds clean) |
+| `apple_csp` | 55003   | hosts SL backport + legacy-HMAC; 1068 tag 36859's private CommonCrypto headers are available in `aosm/CommonCrypto@mac-os-x-1068` but not in the 10.6 SDK |
+| `checkpw`   | 55471   | Apple's PAM rewrite; 1068 tag 36064's `<DirectoryServiceMIG.h>` can be mig-generated from `aosm/DirectoryService@mac-os-x-1068` but PAM is cleaner. Identical exports |
 
 Every other component is on its `1068` tag. The full pinned map is in
 `build-consistent-framework.sh` (`comp_ver`).

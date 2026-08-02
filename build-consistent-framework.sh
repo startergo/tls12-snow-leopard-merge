@@ -97,15 +97,17 @@ HDRS="$PIECES/Headers $PIECES/PrivateHeaders \$(inherited)"
 # verified inert w.r.t. the AuthItemSet/SecCFObject/MachO layout skew at the time
 # (nm found no references), so this is hygiene, not an active bug fix.
 # checkpw only builds because comp_ver pins it to 55471 (PAM-based); the 1068-tag
-# 36064 needs the private DirectoryServiceMIG.h and cannot compile -- see comp_ver.
+# 36064 needs DirectoryServiceMIG.h mig-generated from aosm/DirectoryService -- a
+# step we don't do, so 36064 doesn't build from this tree as-is. See comp_ver.
 COMPS="cdsa_utilities utilities cdsa_client cssm cdsa_plugin codesigning keychain apple_x509_tp apple_x509_cl apple_file_dl apple_cspdl apple_csp sd_cspdl filedb mds ocspd pkcs12 smime cms authorization asn1 cdsa_utils manifest checkpw"
 
 # compile+stage checkpw directly for one arch.
 #
 # checkpw is the one component we cannot build through xcodebuild:
-#   - the 1068-tag 36064 needs the PRIVATE <DirectoryServiceMIG.h> (kDSStdMachPortName),
-#     which exists nowhere on the system, in the Security repos, or in the project,
-#     and there is no .defs to mig-generate it from -> 24 errors, both arches.
+#   - the 1068-tag 36064 needs <DirectoryServiceMIG.h> (kDSStdMachPortName), which
+#     is mig-generatable from aosm/DirectoryService@mac-os-x-1068 but absent from
+#     the project and the SDK -- without that mig step, 24 errors, both arches.
+#     See comp_ver checkpw comment for the full provenance.
 #   - 55471 replaced all that with PAM (pam_appl.h/openpam.h, both present on 10.6)
 #     and compiles fine, BUT its xcodeproj wants config/{lib,release}.xcconfig from
 #     the later Security tree, and those set GCC_VERSION=clang plus
@@ -238,7 +240,7 @@ comp_ver() {
     cdsa_plugin)   echo "libsecurity_cdsa_plugin-36327" ;;
     cdsa_utilities)echo "libsecurity_cdsa_utilities-36658" ;;
     cdsa_utils)    echo "libsecurity_cdsa_utils-36064" ;;
-    checkpw)       echo "libsecurity_checkpw-55471" ;;  # EXCEPTION (proven): 36064 (1068 tag) #includes the PRIVATE <DirectoryServiceMIG.h> and uses kDSStdMachPortName -- absent from the SDK, the Security repos, the project tree and the whole VM filesystem (find / finds nothing), and there is no .defs in the checkpw project to mig-generate it from. 24 compile errors, both arches. Apple rewrote checkpw onto PAM (pam_appl.h/openpam.h, both present on 10.6) by 55471, which builds clean. Exports are IDENTICAL (_checkpw, _checkpw_internal), so the ABI the framework links against is unchanged. 3rd manifest exception after ssl-55002 and apple_csp-55003 -- all three are the same story: the tag version needs something Apple never shipped publicly, a later version was adapted to public APIs.
+    checkpw)       echo "libsecurity_checkpw-55471" ;;  # EXCEPTION (proven): 36064 (1068 tag) #includes the PRIVATE <DirectoryServiceMIG.h> and uses kDSStdMachPortName -- absent from the SDK, the Security repos, and the project tree (find / finds nothing). CORRECTION 2026-08-02: the .defs to mig-generate that header IS public -- aosm/DirectoryService at tag mac-os-x-1068 carries Server/DirectoryServiceMIG.defs + Server/DirectoryServiceMIG_types.h (which defines kDSStdMachPortName as "com.apple.DirectoryService" at line 32); Netzel's build recipe (sourceforge.net/p/leopard-webkit/wiki/BuildInstructionsSecurity/) documents the svn co + mig step. An earlier version of this comment claimed the .defs did not exist publicly, which is wrong. We stay on 55471 because it's Apple's PAM rewrite (pam_appl.h/openpam.h, both present on 10.6) -- cleaner than adding a mig-generation step and matches what Apple shipped by 55471. NOT a "the 1068 tag is impossible" exception; it's a "55471 is cleaner" exception. Exports are IDENTICAL (_checkpw, _checkpw_internal), so the ABI the framework links against is unchanged. 3rd manifest exception after ssl-55002 and apple_csp-55003.
     cms)           echo "libsecurity_cms-36064" ;;
     codesigning)   echo "libsecurity_codesigning-55005" ;;
     cssm)          echo "libsecurity_cssm-40418" ;;
@@ -981,10 +983,15 @@ if [ "$STAGE" = "all" ] || [ "$STAGE" = "components" ]; then
               "$VM/libsecurity_utilities-55010/lib" 4 \
               "vproc++.cpp" "SL-BACKPORT"
   # apple_csp: the SL public-API backport. Both the 1068 tag (36859) and stock
-  # 55003 #include private CommonCrypto headers Apple never released
-  # (cast.h, aesopt.h, opensslDES.h, CommonCryptorSPI.h). This rewrites the
-  # cast/des/rc4/gladman/Mac cipher contexts onto the PUBLIC CommonCryptor.h /
-  # CommonDigest.h API so they build against the 10.6 SDK.
+  # 55003 #include private CommonCrypto headers -- cast.h, aesopt.h, opensslDES.h
+  # (available in aosm/CommonCrypto at tag mac-os-x-1068 under Source/CommonCrypto/)
+  # and CommonCryptorSPI.h (the mode-based cryptor SPI). This rewrite strips all
+  # four CommonCryptorSPI.h includes (castContext.h, desContext.h, gladmanContext.h,
+  # rc4Context.h -- see this patch's 4 removal hunks) and replaces the
+  # cast/des/rc4/gladman/Mac cipher contexts with the PUBLIC CommonCryptor.h /
+  # CommonDigest.h API, so they build against the 10.6 SDK without needing any of
+  # those private headers staged. See comp_ver apple_csp comment + Netzel's recipe
+  # for the upstream-source-of-the-other-three note.
   apply_patch apple_csp-55003-sl-backport.patch \
               "$VM/libsecurity_apple_csp-55003/lib" 4 \
               castContext.h "SL-BACKPORT"
