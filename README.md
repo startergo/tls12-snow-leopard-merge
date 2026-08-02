@@ -1,140 +1,143 @@
-# TLS 1.2 — macOS 10.6 Snow Leopard Security.framework
+# TLS 1.2 for Mac OS X 10.6.8 (Snow Leopard) — Security.framework rebuild
 
-**Status:** ✅ Working end-to-end — TLS 1.2 verified in both `ssltest` and Safari on a live 10.6.8 x86_64 VM.
+A source-level backport that brings **system-wide TLS 1.2** (with AES-GCM and
+modern EC certificate handling) to Snow Leopard 10.6.8 by rebuilding Apple's
+`Security.framework` and its `securityd` daemon from open-source components — no
+per-application dylib injection, no `DYLD_INSERT_LIBRARIES`.
 
-## What This Is
+The stock 10.6.8 `Security.framework` tops out at TLS 1.0 and cannot validate
+many current certificate chains. This project rebuilds the framework from the
+Apple `mac-os-x-1068` component sources, patches TLS 1.2 + AES-GCM into
+`libsecurity_ssl`, and installs a matched framework + daemon pair so that every
+consumer on the system — Safari/WebKit, `curl`, and anything else linking
+`Security.framework` — negotiates TLS 1.2.
 
-A source-level merge of TLS 1.2 (and 1.1) into Apple's `libsecurity_ssl-55002`
-for macOS 10.6.8 Snow Leopard (x86_64 Intel). Stock Snow Leopard tops out at
-TLS 1.0. This project adds the version negotiation, callout table, PRF, MAC,
-and explicit-IV record-layer changes needed for TLS 1.2.
+## Status
 
-**Approach:** source merge against stock `Security-55002`, not a binary patch.
-**Design:** a new `Tls12Callouts` callout table (clean separation, rather than
-Leopard's function-level introspection).
-**Safety:** changes are isolated to `libsecurity_ssl`; no CDSA/keychain ABI
-impact, so a system-default install is viable.
+This build produces a `Security.framework` + `securityd` pair **end-to-end from a
+fresh clone** of the committed sources. A from-scratch run on a wiped 10.6.8
+machine produces:
 
-## Current Status
+- `Security.fat.new` — the rebuilt framework (x86_64 + i386)
+- `dst-securityd-fat/securityd` — the matched daemon (x86_64 + i386)
 
-Both RSA and ECDHE TLS 1.2 handshakes complete and exchange encrypted
-application data. Verified on the live Snow Leopard VM:
+with all 26 framework component archives resolving on both architectures.
 
-- `ssltest` → `tls12.badssl.com`: TLS 1.2, cipher `0xC027`
-  (ECDHE-RSA-AES128-SHA256), real HTTP response.
-- `ssltest` → `howsmyssl.com`: TLS 1.2, cipher `0xC013`
-  (ECDHE-RSA-AES128-SHA), real HTTP response.
-- Safari renders `tls12.badssl.com` and `howsmyssl.com` pages over the
-  patched stack (via `DYLD_INSERT_LIBRARIES` + an in-process function patcher).
+The build is reproducible in the sense that matters: it completes from a clean
+clone of the committed sources, with no hand-staged state, and produces a working
+2-slice (x86_64 + i386) framework and a matched daemon. The exact binary hash
+depends on the toolchain and build host, so it may not be byte-identical across
+machines. Inspect the result with:
 
-Working cipher suites: `0xC013`, `0xC027`, `0x003C`/`0x003D`.
-
-**Known open items (not blocking the baseline):**
-- On the Safari/CFNetwork path, the `signature_algorithms` extension is not
-  reaching the wire, which can cause a downgrade to TLS 1.0 on some hosts.
-- No SNI (`server_name`) extension is sent yet, so multi-cert hosts may return
-  a fallback certificate.
-- AES-GCM suites (`0xC02B`/`0xC02C`) are deferred (no GCM in SL's
-  OpenSSL 0.9.8 / CommonCrypto).
-
-See `docs/tls12-merge-change-map.md` (section X) for the two record-layer
-fixes that produced the first working session, and for the full change map.
-
-## Quick Start
-
-```bash
-# 1. Download sources, patches, and the 10.6 SDK (~500 MB total)
-bash scripts/setup.sh
-
-# 2. Wire up include-path symlinks
-bash scripts/post-setup.sh
-
-# 3. Compile the baseline (stock, to confirm the build env works)
-bash scripts/build-libsecurity-ssl.sh
-
-# 4. Compile the TLS 1.2 build
-bash scripts/build-libsecurity-ssl.sh --patched
+```sh
+lipo -info Security.fat.new
+shasum Security.fat.new
 ```
 
-### Local configuration
+The 32-bit and 64-bit slices are built here; the `ppc7400` slice is grafted from
+the stock system framework with `lipo` at install time, producing the 3-slice
+binary 10.6.8 expects (see [BUILDING.md](BUILDING.md)).
 
-Scripts that talk to the test VM read a git-ignored `config.sh`. Create it
-from the template before running deploy/test scripts:
+Tested toolchain: **Xcode 4.1** with the **10.6 SDK** and **`llvm-gcc-4.2`** on
+Mac OS X 10.6.8. (Xcode 4.2 may also work, per xcodereleases.com; 4.1 is what
+this has been built with.)
 
-```bash
-cp config.sh.example config.sh
-$EDITOR config.sh      # set VM_SUDO_PASS, VM_HOST, VM_HOST_CLEAN
+## Quick start
+
+On a prepared 10.6.8 build host (prerequisites in [BUILDING.md](BUILDING.md)),
+from the repository root, run bootstrap once and then the full build. `VM` is the
+checkout root the scripts resolve their inputs against; it defaults to the
+script's own directory, so setting it is optional when you run from the
+repository root. It is shown explicitly here for clarity:
+
+```sh
+VM="$(pwd)" STAGE=bootstrap bash build-consistent-framework.sh
+VM="$(pwd)" STAGE=all ARCHES='x86_64 i386' bash build-consistent-framework.sh
 ```
 
-`config.sh` is git-ignored and never committed.
+This produces `Security.fat.new` and `dst-securityd-fat/securityd`. To install
+the matched pair, rebuild the dyld shared cache, and reboot:
 
-## Directory Layout
-
-```
-tls12-snow-leopard-merge/
-├── scripts/                       ← build, deploy, diagnostic, and patch scripts
-│   ├── setup.sh                   ← download + extract everything
-│   ├── post-setup.sh              ← wire include-path symlinks
-│   └── build-libsecurity-ssl.sh   ← compile stock or --patched
-│
-├── docs/                          ← analysis & spec
-│   ├── tls12-merge-change-map.md  ← master spec + section X (working-baseline fixes)
-│   ├── tls12Callouts.c            ← the new TLS 1.2 callout implementation (compiled in)
-│   └── PROJECT-STATUS-TLS12-MERGE.md
-│
-├── sources/
-│   └── libsecurity_ssl-55002/     ← THE MERGE TARGET (hand-edited; committed)
-│
-├── config.sh.example              ← template for local VM config (config.sh is git-ignored)
-│
-├── downloads/  sdk/  patches/     ← populated by setup.sh (git-ignored, regenerable)
-└── build/                         ← compiled output (git-ignored)
+```sh
+bash install-consistent-and-reboot.sh
 ```
 
-`downloads/`, `sdk/`, `patches/`, `build/`, and the pristine extracted Apple
-trees under `sources/` are all regenerable via `setup.sh` and are git-ignored.
-Only the hand-edited `sources/libsecurity_ssl-55002/`, the new
-`docs/tls12Callouts.c`, the scripts, and the docs are committed.
+After reboot, unlocking the keychain returns 0 and an HTTPS fetch returns 200:
 
-## Architecture
-
-Snow Leopard's Secure Transport dispatches all protocol-version-specific crypto
-through a 10-function callout table (`SslTlsCallouts`). Stock ships two
-instances: `Ssl3Callouts` and `Tls1Callouts`. This merge adds a third,
-`Tls12Callouts`, plus the version-enum, negotiation, and record-layer changes.
-
-**Phase 1 (done):** TLS 1.2 for server-authenticated connections — version
-enums, `SSLContext` fields, negotiation ladder, callout dispatch, the new
-`tls12Callouts.c` (PRF / MAC / key derivation / Finished), HMAC-SHA256 +
-`SSLHashSHA256`, finished-size switches, and the explicit-IV CBC record layer.
-
-**Phase 2 (partial / deferred):** SHA-256 CBC + AES-GCM cipher-suite table
-entries, client-cert `CertificateVerify` for TLS 1.2, SNI and wire-level
-`signature_algorithms` on the CFNetwork path.
-
-## Build Requirements
-
-- macOS host with Xcode command-line tools (clang)
-- 10.6 SDK in `sdk/` (downloaded by `setup.sh`)
-- Deployment target `x86_64`, `-mmacosx-version-min=10.6`
-
-## Testing
-
-After a patched build:
-
-```bash
-# CDSA/keychain ABI safety (must return nothing)
-nm build/libssl-patched/libsecurity_ssl.dylib | grep -iE "cdsa|securityd"
-
-# Confirm TLS 1.2 symbols are present
-nm build/libssl-patched/libsecurity_ssl.dylib | grep Tls12
-
-# Deploy + smoke-test on the Snow Leopard VM
-bash scripts/deploy-to-vm.sh
+```sh
+security unlock-keychain -p <pw> ~/Library/Keychains/login.keychain
+curl -sS -o /dev/null -w '%{http_code}\n' https://www.google.com
 ```
 
-## Branches
+## What's in this repository
 
-- `main` — default branch (release/integration target).
-- `develop` — active development; work lands here first, then is promoted to
-  `main` via pull request.
+```
+build-consistent-framework.sh     Driver: bootstrap → build 26 components → daemon
+link-fat-framework.sh             Links the per-arch Security monoliths
+apply-*.sh, *-ssl-*.sh, patch-*   Build helpers (patches, generator determinism,
+                                  legacy HMAC, SSL add-ons)
+install-consistent-and-reboot.sh  Installs the matched pair, grafts ppc, reboots
+
+libsecurity_*-<ver>/              The 26 pinned framework component sources
+securityd-40600/                  The securityd daemon source
+libsecurityd-37613/               MIG client/server + securityd_client headers
+SecurityTokend-55000/             Token daemon interface
+libsecurity_agent-55000/          SecurityAgent client (daemon link chain)
+libsecurity_cryptkit-55002/       Vendored legacy-HMAC crypto (keychain unlock)
+Security-55002/                   Umbrella: Security.order + export lists
+Security-55471/                   Donor tree (provenance only — see note below)
+
+vendor/                           ANTLR runtime + trust anchors (ssl_anchors.pem)
+patches/                          Source patches applied during the build
+stubs/                            Headers absent from the 10.6 SDK (asn1 SPI,
+                                  NSS/NSPR, fsctl, audit_session, …)
+extra-headers/, priv-headers/     Additional staged headers
+src/                              TLS 1.2 / AES-GCM implementation added to ssl
+sl-compat-prefix.h                Compat prefix force-included into every compile
+ssltest.c, ssltest_multi.c        TLS test programs (link -framework Security)
+```
+
+### Trust anchors
+
+The root certificates the rebuilt trust path validates against ship in-tree at
+`vendor/anchors/ssl_anchors.pem` (219 roots) and are staged automatically during
+`STAGE=bootstrap`. No separate root-import step is required; validation of
+current certificate chains works out of the box.
+
+### Component versions
+
+The build uses the Apple **`mac-os-x-1068`** (10.6.8) component set with three
+deliberate exceptions, each because the `1068` tag needs a private header Apple
+never published while a later version was adapted to public APIs:
+
+| component   | version | why not the 1068 tag |
+|-------------|---------|----------------------|
+| `ssl`       | 55002   | carries the TLS 1.2 + AES-GCM patches (1068 tag is 40581) |
+| `apple_csp` | 55003   | SL backport onto public CommonCrypto API + legacy-HMAC (1068 tag 36859 needs private CommonCrypto headers) |
+| `checkpw`   | 55471   | 1068 tag 36064 needs a private DirectoryService MIG header; 55471 uses PAM, identical exports |
+
+Every other component is on its `1068` tag. The full pinned map is in
+`build-consistent-framework.sh` (`comp_ver`).
+
+> **Note on `Security-55471/`.** This umbrella tree is kept for provenance only.
+> The build does not read it: everything needed from it was extracted into
+> standalone trees (`libsecurity_checkpw-55471`, `libsecurity_cryptkit-55002`)
+> or dereferenced into `stubs/` (the asn1 SPI / NSS / NSPR headers). It is
+> retained so the origin of those extracted files is auditable.
+
+## Scope and limitations
+
+- **Target:** Mac OS X 10.6.8 only. The backport patches the native 10.6 CSSM /
+  SecureTransport and depends on the stock `libcrypto.0.9.8` being present.
+- **Known open issue:** TLS 1.2 session resumption fails intermittently under
+  concurrent load. Full handshakes are unaffected.
+- This is a research/preservation project for a long-obsolete OS. It replaces a
+  core system framework; read [BUILDING.md](BUILDING.md), keep the printed
+  recovery commands, and do not run it on a machine you cannot restore.
+
+## License
+
+The Apple `libsecurity_*`, `securityd`, and `Security` sources are under the
+Apple Public Source License (see `APPLE_LICENSE` in each component tree). Vendored
+third-party code (ANTLR runtime) retains its own license. Patches and build
+scripts in this repository are provided as-is.
