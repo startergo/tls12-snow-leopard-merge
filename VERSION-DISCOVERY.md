@@ -64,23 +64,28 @@ existed for the wrong versions were dropped.
 ## AS-BUILT: the pinned version map
 
 The `comp_ver` map is a **`mac-os-x-1068` manifest with three documented
-exceptions**. The exceptions share a common shape: **the plain 1068 tag for
-that component `#include`s a private header that is not shipped in the 10.6
-SDK and is not co-located in the component's own source tree**. The header may
+exceptions**, with two distinct shapes:
+
+**Private-header exception (`apple_csp`, `checkpw`).** The plain 1068 tag for
+these components `#include`s a private header that is not shipped in the 10.6
+SDK and is not co-located in the component's own source tree. The header may
 exist in a companion Apple open-source tree (`apple_csp`'s CommonCrypto
 headers — `cast.h`, `aesopt.h`, `opensslDES.h` — are present at the 1068 tag
 of `aosm/CommonCrypto` under `Source/CommonCrypto/`; `checkpw`'s
 `<DirectoryServiceMIG.h>` exists nowhere public and cannot be mig-generated
 from anything in the project), but is absent from the SDK and from the
-component tree itself. For each exception, a different version — a Snow
-Leopard backport or an adjacent release — was used that compiles against
-public APIs instead, with **identical exports and an unchanged linked ABI**,
-so the framework the rest of the build links against is the same. The
-non-1068 version is kept because of what lives on it: `apple_csp-55003` hosts
-the SL-backport adaptation onto the public CommonCryptor/CommonDigest API and
-the legacy-HMAC keychain-unlock vendoring; `ssl-55002` carries the TLS 1.2 +
-AES-GCM patches that are the point of the project; `checkpw-55471` is Apple's
-PAM rewrite (the 36064 tag is genuinely unbuildable from public sources).
+component tree itself. For each, a different version — a Snow Leopard
+backport or an adjacent release — was used that compiles against public APIs
+instead, with **identical exports and an unchanged linked ABI**.
+`apple_csp-55003` hosts the SL-backport adaptation onto the public
+CommonCryptor/CommonDigest API and the legacy-HMAC keychain-unlock
+vendoring. `checkpw-55471` is Apple's PAM rewrite (the 36064 tag is genuinely
+unbuildable from public sources).
+
+**Patch-carrying exception (`ssl`).** The plain 1068 tag (40581) builds
+clean; `ssl-55002` is kept because it carries the TLS 1.2 + AES-GCM patches
+that are the point of the project, on top of the SL base. This is a
+deliberate divergence to host this project's TLS work, not a header issue.
 
     apple_csp   55003   1068 tag 36859 #includes private CommonCrypto headers
                         (cast.h, aesopt.h, opensslDES.h) that are absent from the
