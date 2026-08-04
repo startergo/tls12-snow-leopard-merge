@@ -39,6 +39,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <pthread.h>
 
 #define LIBCRYPTO_PATH   "/usr/lib/libcrypto.0.9.8.dylib"
 #define ANCHOR_BUNDLE    "/usr/local/SecurityPieces/ssl_anchors.pem"
@@ -91,9 +92,80 @@ typedef void *(*X509_EXTENSION_get_data_fn)(void *ex);
 typedef unsigned char *(*ASN1_STRING_data_fn)(void *x);
 typedef int   (*ASN1_STRING_length_fn)(void *x);
 
+/* OpenSSL 0.9.8 multi-threading setup -- without locking + id callbacks,
+ * concurrent calls into libcrypto race in OBJ_NAME_add, X509_STORE, the SSL
+ * session cache, etc. The crash signature is a double-free in OBJ_NAME_add
+ * reached via OpenSSL_add_all_digests -> EVP_add_digest when two threads
+ * init simultaneously. */
+typedef int           (*crypto_num_locks_fn)(void);
+typedef void          (*crypto_set_locking_callback_fn)(void (*cb)(int, int, const char *, int));
+typedef void          (*crypto_set_id_callback_fn)(unsigned long (*cb)(void));
+#define TLS12_CRYPTO_LOCK 0x01  /* matches openssl/crypto.h CRYPTO_LOCK */
+
 #ifndef NID_subject_alt_name
 #define NID_subject_alt_name 85
 #endif
+
+/* Process-wide libcrypto init state. pthread_once guarantees the dlopen +
+ * OpenSSL_add_all_digests + threading-callback setup happens exactly once
+ * across all threads, eliminating the racy repeated-init that caused the
+ * SIGABRT/double-free under concurrent HTTPS (e.g., WebKit media playback).
+ * NOTE: tls12_trusteval.c has its own identical copy of this block. CRYPTO
+ * state is process-wide, so whichever file inits first installs the locking
+ * callback; the second init's call to CRYPTO_set_locking_callback just
+ * overwrites with its own (equivalent) cb + mutex array. Mutex arrays are
+ * leaked at process exit -- acceptable for process-lifetime state. */
+static pthread_once_t      g_libcrypto_once = PTHREAD_ONCE_INIT;
+static void               *g_libcrypto_h    = NULL;
+static int                 g_libcrypto_ok   = 0;
+static pthread_mutex_t    *g_openssl_locks  = NULL;
+static int                 g_openssl_nlocks = 0;
+
+static void tls12_openssl_locking_cb(int mode, int n, const char *file, int line) {
+    if (!g_openssl_locks) return;
+    if (mode & TLS12_CRYPTO_LOCK) pthread_mutex_lock(&g_openssl_locks[n]);
+    else                          pthread_mutex_unlock(&g_openssl_locks[n]);
+}
+
+static unsigned long tls12_openssl_thread_id_cb(void) {
+    return (unsigned long)pthread_self();
+}
+
+static void tls12_init_libcrypto_once(void) {
+    g_libcrypto_h = dlopen(LIBCRYPTO_PATH, RTLD_LAZY);
+    if (!g_libcrypto_h) return;
+
+    /* Register digests/algorithms. The openssl CLI does this at startup;
+     * a libcrypto loaded via dlopen does not, so we must. */
+    add_all_algorithms_fn pAddAll =
+        (add_all_algorithms_fn)dlsym(g_libcrypto_h, "OpenSSL_add_all_algorithms");
+    if (!pAddAll)
+        pAddAll = (add_all_algorithms_fn)dlsym(g_libcrypto_h, "OPENSSL_add_all_algorithms_noconf");
+    add_all_algorithms_fn pAddDig =
+        (add_all_algorithms_fn)dlsym(g_libcrypto_h, "OpenSSL_add_all_digests");
+    if (pAddAll) pAddAll();
+    if (pAddDig) pAddDig();
+
+    /* Install 0.9.8's required multi-threading callbacks. Without these, any
+     * concurrent OpenSSL operation can race in libcrypto's global tables. */
+    crypto_num_locks_fn            pNumLocks = (crypto_num_locks_fn)          dlsym(g_libcrypto_h, "CRYPTO_num_locks");
+    crypto_set_locking_callback_fn pSetLock  = (crypto_set_locking_callback_fn)dlsym(g_libcrypto_h, "CRYPTO_set_locking_callback");
+    crypto_set_id_callback_fn      pSetId    = (crypto_set_id_callback_fn)    dlsym(g_libcrypto_h, "CRYPTO_set_id_callback");
+    if (pNumLocks && pSetLock && pSetId) {
+        g_openssl_nlocks = pNumLocks();
+        if (g_openssl_nlocks > 0) {
+            g_openssl_locks = (pthread_mutex_t *)calloc((size_t)g_openssl_nlocks, sizeof(pthread_mutex_t));
+            if (g_openssl_locks) {
+                int i;
+                for (i = 0; i < g_openssl_nlocks; i++) pthread_mutex_init(&g_openssl_locks[i], NULL);
+                pSetLock(tls12_openssl_locking_cb);
+                pSetId(tls12_openssl_thread_id_cb);
+            }
+        }
+    }
+
+    g_libcrypto_ok = 1;
+}
 
 /* Case-insensitive hostname match with a single leading-wildcard label. */
 static int hostname_matches(const char *pattern, size_t plen,
@@ -400,12 +472,12 @@ static int tls12_verify_ecdsa_sha2(void *h, void *subject, void *issuer)
 OSStatus sslVerifyCertChainOpenSSL(SSLContext *ctx,
                                    const SSLCertificate *certChain)
 {
-    static void *h = NULL;
-    if (!h) h = dlopen(LIBCRYPTO_PATH, RTLD_LAZY);
-    if (!h) {
+    pthread_once(&g_libcrypto_once, tls12_init_libcrypto_once);
+    if (!g_libcrypto_ok) {
         sslErrorLog("sslVerifyCertChainOpenSSL: can't open libcrypto\n");
         return errSSLXCertChainInvalid;
     }
+    void *h = g_libcrypto_h;  /* cached by tls12_init_libcrypto_once */
 
     d2i_X509_fn                 pd2i_X509     = (d2i_X509_fn)dlsym(h, "d2i_X509");
     X509_free_fn                pX509_free    = (X509_free_fn)dlsym(h, "X509_free");
@@ -438,22 +510,9 @@ OSStatus sslVerifyCertChainOpenSSL(SSLContext *ctx,
         return errSSLXCertChainInvalid;
     }
 
-    /* Register all algorithms/digests so 0.9.8 can verify sha256WithRSAEncryption
-     * signatures (google's leaf). Without this, RSA_verify with SHA-256 fails
-     * and X509_verify_cert returns err 7 at depth 0. The command-line openssl
-     * does this automatically; our dlopen'd libcrypto does not. */
-    {
-        add_all_algorithms_fn pAddAll =
-            (add_all_algorithms_fn)dlsym(h, "OpenSSL_add_all_algorithms");
-        if (!pAddAll)
-            pAddAll = (add_all_algorithms_fn)dlsym(h, "OPENSSL_add_all_algorithms_noconf");
-        add_all_algorithms_fn pAddDigests =
-            (add_all_algorithms_fn)dlsym(h, "OpenSSL_add_all_digests");
-        if (pAddAll)     pAddAll();
-        if (pAddDigests) pAddDigests();
-        sslErrorLog("sslVerifyCertChainOpenSSL: algos registered (addAll=%p addDig=%p)\n",
-                    (void*)pAddAll, (void*)pAddDigests);
-    }
+    /* Algorithm/digest registration and OpenSSL threading setup happen once
+     * per process via tls12_init_libcrypto_once() (pthread_once). No per-call
+     * re-registration here -- that was racy under concurrent HTTPS. */
 
     OSStatus result = errSSLXCertChainInvalid;
     void *store = NULL, *sctx = NULL, *untrusted = NULL, *bio = NULL;
