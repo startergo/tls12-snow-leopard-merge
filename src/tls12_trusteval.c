@@ -34,13 +34,23 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
-#include <pthread.h>
 
 #define LIBCRYPTO_PATH   "/usr/lib/libcrypto.0.9.8.dylib"
 #define ANCHOR_BUNDLE    "/usr/local/SecurityPieces/ssl_anchors.pem"
 
+/* Process-wide libcrypto init (dlopen + OpenSSL_add_all_digests + 0.9.8
+ * threading callbacks) lives in tls12_chainverify.c, exposed via this
+ * accessor. The init MUST be process-wide rather than per-file: per-file
+ * pthread_once controls do not prevent cross-file concurrent init, which
+ * races in OpenSSL_add_all_digests -> OBJ_NAME_add (the original SIGABRT).
+ * See cubic PR #5 finding at tls12_chainverify.c line 475. tls12_trusteval.o
+ * (libsecurity_keychain archive) references this symbol; tls12_chainverify.o
+ * (libsecurity_ssl archive) defines it; the framework link resolves the
+ * cross-archive reference. Returns the cached libcrypto handle on success,
+ * NULL if init failed (callers must fail closed on NULL). */
+extern void *tls12_libcrypto_handle(void);
+
 /* ---- libcrypto function typedefs (opaque void* handles; never deref) ---- */
-typedef void  (*add_all_algos_fn)(void);
 typedef void *(*d2i_X509_fn)(void **px, const unsigned char **in, long len);
 typedef void  (*X509_free_fn)(void *x);
 typedef void *(*X509_STORE_new_fn)(void);
@@ -62,67 +72,6 @@ typedef void *(*X509_get_ext_fn)(void *x, int loc);
 typedef void *(*X509_EXTENSION_get_data_fn)(void *ex);
 typedef unsigned char *(*ASN1_STRING_data_fn)(void *x);
 typedef int   (*ASN1_STRING_length_fn)(void *x);
-/* OpenSSL 0.9.8 multi-threading setup -- without locking + id callbacks,
- * concurrent calls into libcrypto race in OBJ_NAME_add, X509_STORE, the SSL
- * session cache, etc. The crash signature is a double-free in OBJ_NAME_add
- * reached via OpenSSL_add_all_digests -> EVP_add_digest when two threads
- * init simultaneously. */
-typedef int           (*crypto_num_locks_fn)(void);
-typedef void          (*crypto_set_locking_callback_fn)(void (*cb)(int, int, const char *, int));
-typedef void          (*crypto_set_id_callback_fn)(unsigned long (*cb)(void));
-#define TLS12_CRYPTO_LOCK 0x01  /* matches openssl/crypto.h CRYPTO_LOCK */
-
-/* Process-wide libcrypto init state. pthread_once guarantees the dlopen +
- * OpenSSL_add_all_digests + threading-callback setup happens exactly once
- * across all threads, eliminating the racy repeated-init that caused the
- * SIGABRT/double-free under concurrent HTTPS (e.g., WebKit media playback). */
-static pthread_once_t      g_libcrypto_once = PTHREAD_ONCE_INIT;
-static void               *g_libcrypto_h    = NULL;
-static int                 g_libcrypto_ok   = 0;
-static pthread_mutex_t    *g_openssl_locks  = NULL;
-static int                 g_openssl_nlocks = 0;
-
-static void tls12_openssl_locking_cb(int mode, int n, const char *file, int line) {
-    if (!g_openssl_locks) return;
-    if (mode & TLS12_CRYPTO_LOCK) pthread_mutex_lock(&g_openssl_locks[n]);
-    else                          pthread_mutex_unlock(&g_openssl_locks[n]);
-}
-
-static unsigned long tls12_openssl_thread_id_cb(void) {
-    return (unsigned long)pthread_self();
-}
-
-static void tls12_init_libcrypto_once(void) {
-    g_libcrypto_h = dlopen(LIBCRYPTO_PATH, RTLD_LAZY);
-    if (!g_libcrypto_h) return;
-
-    /* Register digests/algorithms. The openssl CLI does this at startup;
-     * a libcrypto loaded via dlopen does not, so we must. */
-    add_all_algos_fn paa = (add_all_algos_fn)dlsym(g_libcrypto_h, "OpenSSL_add_all_algorithms");
-    if (!paa) paa = (add_all_algos_fn)dlsym(g_libcrypto_h, "OPENSSL_add_all_algorithms_noconf");
-    if (!paa) paa = (add_all_algos_fn)dlsym(g_libcrypto_h, "OpenSSL_add_all_digests");
-    if (paa) paa();
-
-    /* Install 0.9.8's required multi-threading callbacks. Without these, any
-     * concurrent OpenSSL operation can race in libcrypto's global tables. */
-    crypto_num_locks_fn          pNumLocks  = (crypto_num_locks_fn)         dlsym(g_libcrypto_h, "CRYPTO_num_locks");
-    crypto_set_locking_callback_fn pSetLock = (crypto_set_locking_callback_fn)dlsym(g_libcrypto_h, "CRYPTO_set_locking_callback");
-    crypto_set_id_callback_fn    pSetId     = (crypto_set_id_callback_fn)   dlsym(g_libcrypto_h, "CRYPTO_set_id_callback");
-    if (pNumLocks && pSetLock && pSetId) {
-        g_openssl_nlocks = pNumLocks();
-        if (g_openssl_nlocks > 0) {
-            g_openssl_locks = (pthread_mutex_t *)calloc((size_t)g_openssl_nlocks, sizeof(pthread_mutex_t));
-            if (g_openssl_locks) {
-                int i;
-                for (i = 0; i < g_openssl_nlocks; i++) pthread_mutex_init(&g_openssl_locks[i], NULL);
-                pSetLock(tls12_openssl_locking_cb);
-                pSetId(tls12_openssl_thread_id_cb);
-            }
-        }
-    }
-
-    g_libcrypto_ok = 1;
-}
 
 #ifndef NID_subject_alt_name
 #define NID_subject_alt_name 85
@@ -378,9 +327,8 @@ extern "C"
 #endif
 int tls12TrustEvaluateOpenSSL(CFArrayRef certs, const char *hostname, size_t hostlen)
 {
-    pthread_once(&g_libcrypto_once, tls12_init_libcrypto_once);
-    if (!g_libcrypto_ok) return -1;
-    void *h = g_libcrypto_h;  /* cached by tls12_init_libcrypto_once */
+    void *h = tls12_libcrypto_handle();  /* process-wide once-init in tls12_chainverify.c */
+    if (!h) return -1;
 
     d2i_X509_fn                 pd2i          = (d2i_X509_fn)dlsym(h, "d2i_X509");
     X509_free_fn                pX509_free    = (X509_free_fn)dlsym(h, "X509_free");

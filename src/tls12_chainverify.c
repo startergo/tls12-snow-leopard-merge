@@ -100,24 +100,27 @@ typedef int   (*ASN1_STRING_length_fn)(void *x);
 typedef int           (*crypto_num_locks_fn)(void);
 typedef void          (*crypto_set_locking_callback_fn)(void (*cb)(int, int, const char *, int));
 typedef void          (*crypto_set_id_callback_fn)(unsigned long (*cb)(void));
+typedef void        *(*crypto_get_locking_callback_fn)(void);
 #define TLS12_CRYPTO_LOCK 0x01  /* matches openssl/crypto.h CRYPTO_LOCK */
 
 #ifndef NID_subject_alt_name
 #define NID_subject_alt_name 85
 #endif
 
-/* Process-wide libcrypto init state. pthread_once guarantees the dlopen +
- * OpenSSL_add_all_digests + threading-callback setup happens exactly once
- * across all threads, eliminating the racy repeated-init that caused the
- * SIGABRT/double-free under concurrent HTTPS (e.g., WebKit media playback).
- * NOTE: tls12_trusteval.c has its own identical copy of this block. CRYPTO
- * state is process-wide, so whichever file inits first installs the locking
- * callback; the second init's call to CRYPTO_set_locking_callback just
- * overwrites with its own (equivalent) cb + mutex array. Mutex arrays are
- * leaked at process exit -- acceptable for process-lifetime state. */
+/* Process-wide libcrypto init state. SINGLE pthread_once for the whole
+ * Security.framework -- not per-file. tls12_trusteval.c calls
+ * tls12_libcrypto_handle() (defined below) instead of running its own init,
+ * because per-file pthread_once controls do not prevent cross-file concurrent
+ * init (cubic PR #5 P0): two threads entering the SecTrust and SSL paths
+ * simultaneously could each trigger their own file's once, both running
+ * OpenSSL_add_all_digests concurrently, racing in OBJ_NAME_add -> the
+ * original SIGABRT. Single once eliminates that.
+ *
+ * Mutex arrays are leaked at process exit -- acceptable for process-lifetime
+ * state. */
 static pthread_once_t      g_libcrypto_once = PTHREAD_ONCE_INIT;
 static void               *g_libcrypto_h    = NULL;
-static int                 g_libcrypto_ok   = 0;
+static int                 g_libcrypto_ok   = 0;  /* set ONLY if locks installed */
 static pthread_mutex_t    *g_openssl_locks  = NULL;
 static int                 g_openssl_nlocks = 0;
 
@@ -146,8 +149,8 @@ static void tls12_init_libcrypto_once(void) {
     if (pAddAll) pAddAll();
     if (pAddDig) pAddDig();
 
-    /* Install 0.9.8's required multi-threading callbacks. Without these, any
-     * concurrent OpenSSL operation can race in libcrypto's global tables. */
+    /* Install 0.9.8's required multi-threading callbacks. Single install --
+     * no other code path installs them, so no overwrite race. */
     crypto_num_locks_fn            pNumLocks = (crypto_num_locks_fn)          dlsym(g_libcrypto_h, "CRYPTO_num_locks");
     crypto_set_locking_callback_fn pSetLock  = (crypto_set_locking_callback_fn)dlsym(g_libcrypto_h, "CRYPTO_set_locking_callback");
     crypto_set_id_callback_fn      pSetId    = (crypto_set_id_callback_fn)    dlsym(g_libcrypto_h, "CRYPTO_set_id_callback");
@@ -160,11 +163,24 @@ static void tls12_init_libcrypto_once(void) {
                 for (i = 0; i < g_openssl_nlocks; i++) pthread_mutex_init(&g_openssl_locks[i], NULL);
                 pSetLock(tls12_openssl_locking_cb);
                 pSetId(tls12_openssl_thread_id_cb);
+                /* Fail closed (cubic PR #5 P1): only mark OK once the locks
+                 * are actually installed. Callers see NULL and fall back to
+                 * their pre-TLS1.2 path -- degraded (CSSM TP / handshake
+                 * fail) but safe, not racing. */
+                g_libcrypto_ok = 1;
             }
         }
     }
+}
 
-    g_libcrypto_ok = 1;
+/* Public accessor: process-wide once-init + return cached handle.
+ * Called from tls12TrustEvaluateOpenSSL (libsecurity_keychain archive) and
+ * sslVerifyCertChainOpenSSL (this file, libsecurity_ssl archive). The cross-
+ * archive reference resolves at Security.framework link time. */
+void *tls12_libcrypto_handle(void) {
+    pthread_once(&g_libcrypto_once, tls12_init_libcrypto_once);
+    if (!g_libcrypto_ok) return NULL;
+    return g_libcrypto_h;
 }
 
 /* Case-insensitive hostname match with a single leading-wildcard label. */
@@ -472,12 +488,11 @@ static int tls12_verify_ecdsa_sha2(void *h, void *subject, void *issuer)
 OSStatus sslVerifyCertChainOpenSSL(SSLContext *ctx,
                                    const SSLCertificate *certChain)
 {
-    pthread_once(&g_libcrypto_once, tls12_init_libcrypto_once);
-    if (!g_libcrypto_ok) {
+    void *h = tls12_libcrypto_handle();  /* process-wide once-init */
+    if (!h) {
         sslErrorLog("sslVerifyCertChainOpenSSL: can't open libcrypto\n");
         return errSSLXCertChainInvalid;
     }
-    void *h = g_libcrypto_h;  /* cached by tls12_init_libcrypto_once */
 
     d2i_X509_fn                 pd2i_X509     = (d2i_X509_fn)dlsym(h, "d2i_X509");
     X509_free_fn                pX509_free    = (X509_free_fn)dlsym(h, "X509_free");
