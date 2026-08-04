@@ -15,6 +15,12 @@
 #include <dlfcn.h>
 #include <stdio.h>
 
+/* cubic PR #5 P1: route libcrypto usage through tls12_chainverify.c's
+ * process-wide once-init so OpenSSL 0.9.8's locking callbacks are installed
+ * before any libcrypto call. The static-dlopen pattern below could fire
+ * before the chain/trust path triggered the init. */
+extern void *tls12_libcrypto_handle(void);
+
 #ifdef GCM_STANDALONE_TEST
   /* standalone self-test build: no project logging available */
   #define sslErrorLog(...) fprintf(stderr, __VA_ARGS__)
@@ -37,12 +43,9 @@ static int resolveAesSyms(void) {
     if (g_resolved != 0) {
         return (g_resolved == 1) ? 0 : -1;
     }
-    void *h = dlopen("/usr/lib/libcrypto.0.9.8.dylib", RTLD_LAZY);
+    void *h = tls12_libcrypto_handle();
     if (!h) {
-        h = dlopen("libcrypto.dylib", RTLD_LAZY);
-    }
-    if (!h) {
-        sslErrorLog("sslGcmAes: cannot dlopen libcrypto\n");
+        sslErrorLog("sslGcmAes: cannot init libcrypto\n");
         g_resolved = -1;
         return -1;
     }

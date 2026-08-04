@@ -138,8 +138,59 @@ static void tls12_init_libcrypto_once(void) {
     g_libcrypto_h = dlopen(LIBCRYPTO_PATH, RTLD_LAZY);
     if (!g_libcrypto_h) return;
 
-    /* Register digests/algorithms. The openssl CLI does this at startup;
-     * a libcrypto loaded via dlopen does not, so we must. */
+    /* Install 0.9.8's required multi-threading callbacks BEFORE any other
+     * libcrypto call. cubic PR #5 P1: the previous order (register algos
+     * first, then install cb) left a window where OpenSSL_add_all_digests
+     * mutated the algorithm registry while another thread could enter
+     * libcrypto unlocked. Installing cb first means the registry mutation
+     * happens under the lock. */
+    crypto_num_locks_fn            pNumLocks = (crypto_num_locks_fn)          dlsym(g_libcrypto_h, "CRYPTO_num_locks");
+    crypto_set_locking_callback_fn pSetLock  = (crypto_set_locking_callback_fn)dlsym(g_libcrypto_h, "CRYPTO_set_locking_callback");
+    crypto_set_id_callback_fn      pSetId    = (crypto_set_id_callback_fn)    dlsym(g_libcrypto_h, "CRYPTO_set_id_callback");
+    crypto_get_locking_callback_fn pGetLock  = (crypto_get_locking_callback_fn)dlsym(g_libcrypto_h, "CRYPTO_get_locking_callback");
+    if (pNumLocks && pSetLock && pSetId && pGetLock) {
+        void *existing_cb = pGetLock();
+        if (existing_cb != NULL) {
+            /* cubic PR #5 P1: another library (Python ssl, etc.) already
+             * installed a cb. libcrypto IS thread-safe via their cb; we
+             * don't need our own. Mark OK; skip our install. */
+            g_libcrypto_ok = 1;
+        } else {
+            /* No cb installed; install ours. */
+            g_openssl_nlocks = pNumLocks();
+            if (g_openssl_nlocks > 0) {
+                g_openssl_locks = (pthread_mutex_t *)calloc((size_t)g_openssl_nlocks, sizeof(pthread_mutex_t));
+                if (g_openssl_locks) {
+                    /* cubic PR #5 P2: check each pthread_mutex_init result;
+                     * if any fails, roll back what we already initialized,
+                     * free the array, and bail without installing the cb. */
+                    int i;
+                    int init_ok = 1;
+                    for (i = 0; i < g_openssl_nlocks; i++) {
+                        if (pthread_mutex_init(&g_openssl_locks[i], NULL) != 0) {
+                            init_ok = 0;
+                            while (i > 0) pthread_mutex_destroy(&g_openssl_locks[--i]);
+                            free(g_openssl_locks);
+                            g_openssl_locks = NULL;
+                            break;
+                        }
+                    }
+                    if (init_ok) {
+                        pSetLock(tls12_openssl_locking_cb);
+                        pSetId(tls12_openssl_thread_id_cb);
+                        g_libcrypto_ok = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Register digests/algorithms. Runs under the just-installed lock if
+     * another thread enters libcrypto concurrently. The openssl CLI does
+     * this at startup; a libcrypto loaded via dlopen does not, so we must.
+     * If cb install was skipped or failed AND we marked OK based on an
+     * existing cb, this still runs unlocked from our perspective but the
+     * existing cb (whoever installed it) protects libcrypto globally. */
     add_all_algorithms_fn pAddAll =
         (add_all_algorithms_fn)dlsym(g_libcrypto_h, "OpenSSL_add_all_algorithms");
     if (!pAddAll)
@@ -148,29 +199,6 @@ static void tls12_init_libcrypto_once(void) {
         (add_all_algorithms_fn)dlsym(g_libcrypto_h, "OpenSSL_add_all_digests");
     if (pAddAll) pAddAll();
     if (pAddDig) pAddDig();
-
-    /* Install 0.9.8's required multi-threading callbacks. Single install --
-     * no other code path installs them, so no overwrite race. */
-    crypto_num_locks_fn            pNumLocks = (crypto_num_locks_fn)          dlsym(g_libcrypto_h, "CRYPTO_num_locks");
-    crypto_set_locking_callback_fn pSetLock  = (crypto_set_locking_callback_fn)dlsym(g_libcrypto_h, "CRYPTO_set_locking_callback");
-    crypto_set_id_callback_fn      pSetId    = (crypto_set_id_callback_fn)    dlsym(g_libcrypto_h, "CRYPTO_set_id_callback");
-    if (pNumLocks && pSetLock && pSetId) {
-        g_openssl_nlocks = pNumLocks();
-        if (g_openssl_nlocks > 0) {
-            g_openssl_locks = (pthread_mutex_t *)calloc((size_t)g_openssl_nlocks, sizeof(pthread_mutex_t));
-            if (g_openssl_locks) {
-                int i;
-                for (i = 0; i < g_openssl_nlocks; i++) pthread_mutex_init(&g_openssl_locks[i], NULL);
-                pSetLock(tls12_openssl_locking_cb);
-                pSetId(tls12_openssl_thread_id_cb);
-                /* Fail closed (cubic PR #5 P1): only mark OK once the locks
-                 * are actually installed. Callers see NULL and fall back to
-                 * their pre-TLS1.2 path -- degraded (CSSM TP / handshake
-                 * fail) but safe, not racing. */
-                g_libcrypto_ok = 1;
-            }
-        }
-    }
 }
 
 /* Public accessor: process-wide once-init + return cached handle.

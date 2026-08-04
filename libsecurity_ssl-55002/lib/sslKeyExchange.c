@@ -38,6 +38,14 @@
 #include "sslBER.h"
 
 #include <assert.h>
+
+/* cubic PR #5 P1: route our libcrypto usage through tls12_chainverify.c's
+ * process-wide once-init, which installs OpenSSL 0.9.8's required locking
+ * callbacks before any libcrypto call. The static-dlopen pattern this file
+ * used previously could fire before the chain/trust path triggered the init,
+ * leaving RSA_verify / ECDSA_verify running without locks under concurrent
+ * handshakes. */
+extern void *tls12_libcrypto_handle(void);
 #include <string.h>
 #include <dlfcn.h>
 
@@ -214,9 +222,7 @@ sslVerifyTLS12RSA(SSLContext *ctx, int nid, const uint8 *hash, size_t hashLen,
     int rc;
     OSStatus ortn = errSSLCrypto;
 
-    static void *libcrypto_rsa = NULL;
-    if (!libcrypto_rsa)
-        libcrypto_rsa = dlopen("/usr/lib/libcrypto.0.9.8.dylib", RTLD_LAZY);
+    void *libcrypto_rsa = tls12_libcrypto_handle();
     if (!libcrypto_rsa) {
         sslErrorLog("sslVerifyTLS12RSA: can't open libcrypto\n");
         return errSSLCrypto;
@@ -277,10 +283,7 @@ sslVerifyTLS12ECDSA(SSLContext *ctx, const uint8 *hash, size_t hashLen,
     int   rc;
     OSStatus ortn = errSSLCrypto;
 
-    static void *libcrypto_ecdsa = NULL;
-    if (!libcrypto_ecdsa) {
-        libcrypto_ecdsa = dlopen("/usr/lib/libcrypto.0.9.8.dylib", RTLD_LAZY);
-    }
+    void *libcrypto_ecdsa = tls12_libcrypto_handle();
     if (!libcrypto_ecdsa) {
         sslErrorLog("sslVerifyTLS12ECDSA: can't open libcrypto\n");
         return errSSLCrypto;
@@ -1068,11 +1071,7 @@ SSLEncodeRSAKeyExchange(SSLRecord *keyExchange, SSLContext *ctx)
 		#define RSA_OFFSET_E  40
 		#define RSA_PKCS1_PADDING 1
 
-		static void *libcrypto = NULL;
-		if (!libcrypto) {
-			libcrypto = dlopen("/usr/lib/libcrypto.0.9.8.dylib", RTLD_LAZY);
-			if (!libcrypto) dlopen("libcrypto.dylib", RTLD_LAZY);
-		}
+		void *libcrypto = tls12_libcrypto_handle();
 		if (libcrypto) {
 			BN_bin2bn_fn          pBN_bin2bn          = (BN_bin2bn_fn)dlsym(libcrypto, "BN_bin2bn");
 			BN_free_fn            pBN_free            = (BN_free_fn)dlsym(libcrypto, "BN_free");
@@ -1377,10 +1376,7 @@ SSLGenClientECDHKeyAndExchange(SSLContext *ctx)
 										void *(*KDF)(const void *in, size_t inlen,
 											void *out, size_t *outlen));
 
-	static void *libcrypto_ec = NULL;
-	if (!libcrypto_ec) {
-		libcrypto_ec = dlopen("/usr/lib/libcrypto.0.9.8.dylib", RTLD_LAZY);
-	}
+	void *libcrypto_ec = tls12_libcrypto_handle();
 	if (!libcrypto_ec) {
 		sslErrorLog("SSLGenClientECDHKeyAndExchange: can't open libcrypto\n");
 		return errSSLCrypto;
