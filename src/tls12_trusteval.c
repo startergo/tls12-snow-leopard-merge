@@ -38,8 +38,19 @@
 #define LIBCRYPTO_PATH   "/usr/lib/libcrypto.0.9.8.dylib"
 #define ANCHOR_BUNDLE    "/usr/local/SecurityPieces/ssl_anchors.pem"
 
+/* Process-wide libcrypto init (dlopen + OpenSSL_add_all_digests + 0.9.8
+ * threading callbacks) lives in tls12_chainverify.c, exposed via this
+ * accessor. The init MUST be process-wide rather than per-file: per-file
+ * pthread_once controls do not prevent cross-file concurrent init, which
+ * races in OpenSSL_add_all_digests -> OBJ_NAME_add (the original SIGABRT).
+ * See cubic PR #5 finding at tls12_chainverify.c line 475. tls12_trusteval.o
+ * (libsecurity_keychain archive) references this symbol; tls12_chainverify.o
+ * (libsecurity_ssl archive) defines it; the framework link resolves the
+ * cross-archive reference. Returns the cached libcrypto handle on success,
+ * NULL if init failed (callers must fail closed on NULL). */
+extern void *tls12_libcrypto_handle(void);
+
 /* ---- libcrypto function typedefs (opaque void* handles; never deref) ---- */
-typedef void  (*add_all_algos_fn)(void);
 typedef void *(*d2i_X509_fn)(void **px, const unsigned char **in, long len);
 typedef void  (*X509_free_fn)(void *x);
 typedef void *(*X509_STORE_new_fn)(void);
@@ -316,19 +327,8 @@ extern "C"
 #endif
 int tls12TrustEvaluateOpenSSL(CFArrayRef certs, const char *hostname, size_t hostlen)
 {
-    static void *h = NULL;
-    if (!h) h = dlopen(LIBCRYPTO_PATH, RTLD_LAZY);
+    void *h = tls12_libcrypto_handle();  /* process-wide once-init in tls12_chainverify.c */
     if (!h) return -1;
-
-    /* CRITICAL: register digest/cipher algorithms, or X509_verify_cert fails
-       with X509_V_ERR_CERT_SIGNATURE_FAILURE (err 7). The openssl CLI does this
-       at startup; loading libcrypto via dlopen does NOT, so we must call it. */
-    {
-        add_all_algos_fn paa = (add_all_algos_fn)dlsym(h, "OpenSSL_add_all_algorithms");
-        if (!paa) paa = (add_all_algos_fn)dlsym(h, "OPENSSL_add_all_algorithms_noconf");
-        if (!paa) paa = (add_all_algos_fn)dlsym(h, "OpenSSL_add_all_digests");
-        if (paa) paa();
-    }
 
     d2i_X509_fn                 pd2i          = (d2i_X509_fn)dlsym(h, "d2i_X509");
     X509_free_fn                pX509_free    = (X509_free_fn)dlsym(h, "X509_free");
