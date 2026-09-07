@@ -655,6 +655,7 @@ OSStatus sslVerifyCertChainOpenSSL(SSLContext *ctx,
              * reason. */
             if (err == 7) {
                 int i, ok = 1, ecLinks = 0;
+                int unverIdx[64], unver = 0;
                 /* Chain ORDER is not reliable here: the file header documents the
                  * SSLCertificate list as root-FIRST (SSLProcessCertificate
                  * prepends each received cert) while the parse loop above labels
@@ -689,20 +690,23 @@ OSStatus sslVerifyCertChainOpenSSL(SSLContext *ctx,
                             }
                         }
                     }
-                    /* exactly one cert (the chain top) may be unverified here */
+                    /* Any cert the ECDSA pairing cannot verify (it only covers
+                     * EC-signed links) must chain to a bundle anchor through
+                     * the remaining, RSA-signed links. 2026-09: cross-signed
+                     * chains (e.g. static.files.bbci.co.uk: leaf(EC) ->
+                     * GlobalSign ECC OV CA 2018(EC) -> R5-cross-by-R3 ->
+                     * R3-cross-by-R1) leave TWO certs unverified because the
+                     * cross-cert links are RSA; requiring exactly one top
+                     * failed these chains closed. unver == 0 is still
+                     * rejected: a set signed only by its own members has no
+                     * top and can never reach an anchor. */
                     {
-                        int unver = 0, topIdx = -1;
                         for (i = 0; i < nall; i++)
-                            if (!verified[i]) { unver++; topIdx = i; }
-                        if (unver != 1) {
-                            sslErrorLog("sslVerifyCertChainOpenSSL: %d certs unverified "
-                                        "(expected exactly 1 chain top)\n", unver);
+                            if (!verified[i]) unverIdx[unver++] = i;
+                        if (unver < 1) {
+                            sslErrorLog("sslVerifyCertChainOpenSSL: no unverified "
+                                        "chain top (cycle?)\n");
                             ok = 0;
-                        } else {
-                            /* remember which one to anchor-check */
-                            void *tmp = all[nall-1];
-                            all[nall-1] = all[topIdx];
-                            all[topIdx] = tmp;
                         }
                     }
                 }
@@ -721,39 +725,78 @@ OSStatus sslVerifyCertChainOpenSSL(SSLContext *ctx,
                     }
                 }
 
-                /* the chain top must be issued by a trusted anchor */
+                /* every unverified cert must chain to a trusted anchor. The
+                 * anchor check uses a PURE anchor store (bundle only, no peer
+                 * intermediates) plus the other peer certs on the untrusted
+                 * stack: the main verify store holds the peer intermediates
+                 * too, and a cert present in the store is trusted by
+                 * membership alone -- anchoring against it would let a
+                 * server-supplied self-signed top vouch for itself. RSA links
+                 * on the anchor path are verified natively by libcrypto; if
+                 * the link to the anchor itself is ECDSA-SHA2 (err 7), redo
+                 * it by hand against every bundle anchor. */
                 if (ok && ecLinks > 0) {
-                    void *topCert = all[nall-1];
-                    void *topsctx = pCtx_new();
-                    int anchored = 0;
-                    if (topsctx) {
-                        if (pCtx_init(topsctx, store, topCert, NULL)) {
-                            int tvr = pVerify(topsctx);
-                            int terr = pCtx_geterr(topsctx);
+                    void *anchorStore = pStore_new();
+                    int anchored = (anchorStore != NULL);
+                    int ui;
+                    if (anchorStore) {
+                        void *abio2 = pBIO_new_file(ANCHOR_BUNDLE, "r");
+                        if (abio2) {
+                            void *ax;
+                            while ((ax = pPEM_read(abio2, NULL, NULL, NULL)) != NULL) {
+                                pStore_add(anchorStore, ax);
+                                pX509_free(ax);
+                            }
+                            pBIO_free(abio2);
+                        }
+                    }
+                    for (ui = 0; ui < unver && anchored; ui++) {
+                        void *uCert = all[unverIdx[ui]];
+                        void *uctx = pCtx_new();
+                        void *usk = psk_new();
+                        int uOk = 0;
+                        int k;
+                        if (usk) {
+                            for (k = 0; k < nall; k++)
+                                if (k != unverIdx[ui]) psk_push(usk, all[k]);
+                        }
+                        if (uctx && pCtx_init(uctx, anchorStore, uCert, usk)) {
+                            int tvr = pVerify(uctx);
+                            int terr = pCtx_geterr(uctx);
                             if (tvr == 1) {
-                                anchored = 1;
+                                uOk = 1;
                             } else if (terr == 7) {
-                                /* top cert is ECDSA-SHA2-signed by its anchor:
+                                /* uCert is ECDSA-SHA2-signed by its anchor:
                                  * find that anchor in the bundle and verify. */
                                 void *abio = pBIO_new_file(ANCHOR_BUNDLE, "r");
                                 if (abio) {
                                     void *ax;
                                     while ((ax = pPEM_read(abio, NULL, NULL, NULL)) != NULL) {
-                                        int r = tls12_verify_ecdsa_sha2(h, topCert, ax);
+                                        int r = tls12_verify_ecdsa_sha2(h, uCert, ax);
                                         pX509_free(ax);
-                                        if (r == 1) { anchored = 1; break; }
+                                        if (r == 1) { uOk = 1; break; }
                                     }
                                     pBIO_free(abio);
                                 }
                             }
                         }
-                        pCtx_free(topsctx);
+                        if (uctx) pCtx_free(uctx);
+                        if (usk) psk_free(usk);
+                        if (uOk) {
+                            sslErrorLog("sslVerifyCertChainOpenSSL: cert %d anchored\n",
+                                        unverIdx[ui]);
+                        } else {
+                            sslErrorLog("sslVerifyCertChainOpenSSL: cert %d does not "
+                                        "reach a trusted anchor\n", unverIdx[ui]);
+                            anchored = 0;
+                        }
                     }
+                    if (anchorStore) pStore_free(anchorStore);
                     if (anchored) {
                         result = noErr;
                         sslErrorLog("sslVerifyCertChainOpenSSL: chain VALID via manual "
-                                    "ECDSA-SHA2 verification (%d EC link(s), anchored)\n",
-                                    ecLinks);
+                                    "ECDSA-SHA2 verification (%d EC link(s), %d top "
+                                    "cert(s) anchored)\n", ecLinks, unver);
                     } else {
                         sslErrorLog("sslVerifyCertChainOpenSSL: ECDSA-SHA2 links OK but "
                                     "chain does not reach a trusted anchor\n");

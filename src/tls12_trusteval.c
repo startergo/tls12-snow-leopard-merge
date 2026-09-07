@@ -416,12 +416,13 @@ int tls12TrustEvaluateOpenSSL(CFArrayRef certs, const char *hostname, size_t hos
          *
          * Cert ORDER is not trusted: the SSL-path twin measured index 0 holding
          * the intermediate rather than the leaf, so pair certs by trying every
-         * candidate issuer instead of assuming adjacency. Exactly one cert (the
-         * chain top) may be left unverified; it must then chain to an anchor. */
+         * candidate issuer instead of assuming adjacency. Any cert the pairing
+         * cannot verify (the ECDSA walk only covers EC-signed links) must chain
+         * to a bundle anchor through the remaining, RSA-signed links. */
         if (err == 7) {
             int i, j, ok = 1, ecLinks = 0;
             int verified[64];
-            int unver = 0, topIdx = -1;
+            int unverIdx[64], unver = 0;
 
             for (i = 0; i < nowned; i++) verified[i] = 0;
             for (i = 0; i < nowned; i++) {
@@ -435,9 +436,21 @@ int tls12TrustEvaluateOpenSSL(CFArrayRef certs, const char *hostname, size_t hos
                 }
             }
             for (i = 0; i < nowned; i++)
-                if (!verified[i]) { unver++; topIdx = i; }
-            if (unver != 1) {
-                tlsTrustLog("tls12TrustEvaluateOpenSSL: %d certs unverified (want 1)\n", unver);
+                if (!verified[i]) unverIdx[unver++] = i;
+            /* 2026-09: cross-signed chains leave MORE than one cert unverified.
+             * e.g. static.files.bbci.co.uk serves leaf(EC) -> GlobalSign ECC OV
+             * CA 2018(EC) -> R5-cross-signed-by-R3 -> R3-cross-signed-by-R1:
+             * the two EC links pair up fine, but the cross-cert links above
+             * them are RSA-signed, which tls12_trust_verify_ecdsa cannot
+             * check, so TWO certs stay unverified. Requiring exactly one top
+             * failed these chains closed in Safari ("certificate invalid")
+             * even though every needed root was in the bundle. Instead, EVERY
+             * unverified cert must anchor to the bundle (checked below) --
+             * the cross-cert tail walks there over RSA links. unver == 0 is
+             * still rejected: a set where every cert is signed by another
+             * member has no top at all and can never reach an anchor. */
+            if (unver < 1) {
+                tlsTrustLog("tls12TrustEvaluateOpenSSL: no unverified chain top (cycle?)\n");
                 ok = 0;
             }
 
@@ -451,35 +464,63 @@ int tls12TrustEvaluateOpenSSL(CFArrayRef certs, const char *hostname, size_t hos
                 }
             }
 
-            /* the chain top must be issued by a trusted anchor */
-            if (ok && ecLinks > 0 && topIdx >= 0) {
-                void *topCert = owned[topIdx];
-                void *topctx = pCtx_new();
-                int anchored = 0;
-                if (topctx) {
-                    if (pCtx_init(topctx, store, topCert, NULL)) {
-                        int tvr = pVerify(topctx);
-                        int terr = pGetErr ? pGetErr(topctx) : 0;
-                        if (tvr == 1) anchored = 1;
-                        else if (terr == 7) {
-                            void *abio = pBIO_new_file(ANCHOR_BUNDLE, "r");
-                            if (abio) {
-                                void *ax;
-                                while ((ax = pPEM_read(abio, NULL, NULL, NULL)) != NULL) {
-                                    int r = tls12_trust_verify_ecdsa(h, topCert, ax);
-                                    pX509_free(ax);
-                                    if (r == 1) { anchored = 1; break; }
+            /* every unverified cert must chain to a trusted anchor. The store
+             * holds ONLY bundle anchors (peer certs ride the untrusted stack),
+             * so anchoring can never succeed via store membership of a peer
+             * cert; RSA links on the path are verified natively by libcrypto.
+             * If the link to the anchor itself is ECDSA-SHA2 (err 7 on the
+             * anchor verify), redo it by hand against every bundle anchor. */
+            if (ok && ecLinks > 0) {
+                int anchored = 1;
+                int ui;
+                for (ui = 0; ui < unver && anchored; ui++) {
+                    void *uCert = owned[unverIdx[ui]];
+                    void *uctx = pCtx_new();
+                    int uOk = 0;
+                    if (uctx) {
+                        /* untrusted stack: every OTHER peer cert, so a longer
+                         * RSA cross-cert tail can be walked through to the
+                         * anchor the same way the main verify would. */
+                        void *usk = psk_new();
+                        int k;
+                        if (usk) {
+                            for (k = 0; k < nowned; k++)
+                                if (k != unverIdx[ui]) psk_push(usk, owned[k]);
+                        }
+                        if (pCtx_init(uctx, store, uCert, usk)) {
+                            int tvr = pVerify(uctx);
+                            int terr = pGetErr ? pGetErr(uctx) : 0;
+                            if (tvr == 1) uOk = 1;
+                            else if (terr == 7) {
+                                void *abio = pBIO_new_file(ANCHOR_BUNDLE, "r");
+                                if (abio) {
+                                    void *ax;
+                                    while ((ax = pPEM_read(abio, NULL, NULL, NULL)) != NULL) {
+                                        int r = tls12_trust_verify_ecdsa(h, uCert, ax);
+                                        pX509_free(ax);
+                                        if (r == 1) { uOk = 1; break; }
+                                    }
+                                    pBIO_free(abio);
                                 }
-                                pBIO_free(abio);
                             }
                         }
+                        pCtx_free(uctx);
+                        if (usk) psk_free(usk);
                     }
-                    pCtx_free(topctx);
+                    if (uOk) {
+                        tlsTrustLog("tls12TrustEvaluateOpenSSL: cert %d anchored\n",
+                                    unverIdx[ui]);
+                    } else {
+                        tlsTrustLog("tls12TrustEvaluateOpenSSL: cert %d does not reach "
+                                    "a trusted anchor\n", unverIdx[ui]);
+                        anchored = 0;
+                    }
                 }
                 if (anchored) {
                     result = 0;
                     tlsTrustLog("tls12TrustEvaluateOpenSSL: chain VALID via manual "
-                                "ECDSA-SHA2 verification (%d EC link(s), anchored)\n", ecLinks);
+                                "ECDSA-SHA2 verification (%d EC link(s), %d top cert(s) "
+                                "anchored)\n", ecLinks, unver);
                 } else {
                     tlsTrustLog("tls12TrustEvaluateOpenSSL: EC links OK but no trusted anchor\n");
                     result = -1;
