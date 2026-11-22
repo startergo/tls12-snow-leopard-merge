@@ -34,6 +34,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <stdint.h>
 
 #define LIBCRYPTO_PATH   "/usr/lib/libcrypto.0.9.8.dylib"
 #define ANCHOR_BUNDLE    "/usr/local/SecurityPieces/ssl_anchors.pem"
@@ -64,6 +65,10 @@ typedef int   (*X509_STORE_CTX_get_error_fn)(void *ctx);
 typedef void *(*sk_new_null_fn)(void);
 typedef int   (*sk_push_fn)(void *st, void *data);
 typedef void  (*sk_free_fn)(void *st);
+typedef int   (*sk_num_fn)(const void *st);
+typedef void *(*sk_value_fn)(const void *st, int i);
+/* X509_STORE_CTX_get_error_depth_fn is declared further down (SAN section) */
+typedef void *(*X509_STORE_CTX_get_chain_fn)(void *ctx);
 typedef void *(*BIO_new_file_fn)(const char *filename, const char *mode);
 typedef void  (*BIO_free_fn)(void *bio);
 typedef void *(*PEM_read_bio_X509_fn)(void *bio, void **x, void *cb, void *u);
@@ -315,6 +320,29 @@ int tls12LeafIsEC(CFArrayRef certs)
     return 0;
 }
 
+/* index of x inside owned[0..n) by pointer identity; -1 if not a peer cert.
+ * Store certs (bundle anchors) are distinct objects, so pointer comparison
+ * distinguishes them from peer certs on chains built by X509_verify_cert. */
+static int tls12_trust_peer_index(const void *x, void **owned, int n)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (owned[i] == x) return i;
+    return -1;
+}
+
+/* record a subject->issuer edge (leaf-to-top connectivity check) when both
+ * endpoints are peer certs */
+static void tls12_trust_record_issuer_edge(void *subj, void *issr,
+                                           void **owned, int n,
+                                           uint64_t *issuerBits)
+{
+    int s = tls12_trust_peer_index(subj, owned, n);
+    int v = tls12_trust_peer_index(issr, owned, n);
+    if (s >= 0 && v >= 0 && s != v)
+        issuerBits[s] |= ((uint64_t)1 << v);
+}
+
 /*
  * Verify the cert chain (CFArray of SecCertificateRef, leaf FIRST) via libcrypto.
  * hostname/hostlen may be NULL/0 to skip the SAN check (e.g. non-SSL policy).
@@ -350,11 +378,18 @@ int tls12TrustEvaluateOpenSSL(CFArrayRef certs, const char *hostname, size_t hos
     X509_EXTENSION_get_data_fn  pExtData      = (X509_EXTENSION_get_data_fn)dlsym(h, "X509_EXTENSION_get_data");
     ASN1_STRING_data_fn         pStrData      = (ASN1_STRING_data_fn)dlsym(h, "ASN1_STRING_data");
     ASN1_STRING_length_fn       pStrLen       = (ASN1_STRING_length_fn)dlsym(h, "ASN1_STRING_length");
+    sk_num_fn                   pSkNum        = (sk_num_fn)dlsym(h, "sk_num");
+    sk_value_fn                 pSkValue      = (sk_value_fn)dlsym(h, "sk_value");
+    X509_STORE_CTX_get_error_depth_fn pGetDepth =
+        (X509_STORE_CTX_get_error_depth_fn)dlsym(h, "X509_STORE_CTX_get_error_depth");
+    X509_STORE_CTX_get_chain_fn pGetChain =
+        (X509_STORE_CTX_get_chain_fn)dlsym(h, "X509_STORE_CTX_get_chain");
 
     if (!pd2i || !pX509_free || !pStore_new || !pStore_free || !pStore_add ||
         !pCtx_new || !pCtx_free || !pCtx_init || !pVerify ||
         !psk_new || !psk_push || !psk_free || !pBIO_new_file || !pBIO_free ||
-        !pPEM_read || !pExtByNID || !pGetExt || !pExtData || !pStrData || !pStrLen)
+        !pPEM_read || !pExtByNID || !pGetExt || !pExtData || !pStrData || !pStrLen ||
+        !pSkNum || !pSkValue || !pGetDepth || !pGetChain)
         return -1;
 
     int result = -1;
@@ -416,28 +451,48 @@ int tls12TrustEvaluateOpenSSL(CFArrayRef certs, const char *hostname, size_t hos
          *
          * Cert ORDER is not trusted: the SSL-path twin measured index 0 holding
          * the intermediate rather than the leaf, so pair certs by trying every
-         * candidate issuer instead of assuming adjacency. Exactly one cert (the
-         * chain top) may be left unverified; it must then chain to an anchor. */
+         * candidate issuer instead of assuming adjacency. Any cert the pairing
+         * cannot verify (the ECDSA walk only covers EC-signed links) must chain
+         * to a bundle anchor through the remaining, RSA-signed links. */
         if (err == 7) {
             int i, j, ok = 1, ecLinks = 0;
             int verified[64];
-            int unver = 0, topIdx = -1;
+            int unverIdx[64], unver = 0;
+            /* issuerBits[i] bit j set == cert j's key verified cert i's
+             * ECDSA-SHA2 signature (j is i's issuer). Feeds both verified[]
+             * and the leaf-to-top connectivity check below. */
+            uint64_t issuerBits[64];
 
-            for (i = 0; i < nowned; i++) verified[i] = 0;
+            for (i = 0; i < nowned; i++) { verified[i] = 0; issuerBits[i] = 0; }
+            /* record EVERY verifying issuer -- no early break: connectivity
+             * needs the full edge set (a cert can legitimately be verifiable
+             * by more than one cross-cert of the same key). */
             for (i = 0; i < nowned; i++) {
                 for (j = 0; j < nowned; j++) {
                     if (i == j) continue;
                     if (tls12_trust_verify_ecdsa(h, owned[i], owned[j]) == 1) {
                         verified[i] = 1; ecLinks++;
+                        issuerBits[i] |= ((uint64_t)1 << j);
                         tlsTrustLog("tls12TrustEvaluateOpenSSL: cert %d verified by cert %d\n", i, j);
-                        break;
                     }
                 }
             }
             for (i = 0; i < nowned; i++)
-                if (!verified[i]) { unver++; topIdx = i; }
-            if (unver != 1) {
-                tlsTrustLog("tls12TrustEvaluateOpenSSL: %d certs unverified (want 1)\n", unver);
+                if (!verified[i]) unverIdx[unver++] = i;
+            /* 2026-09: cross-signed chains leave MORE than one cert unverified.
+             * e.g. static.files.bbci.co.uk serves leaf(EC) -> GlobalSign ECC OV
+             * CA 2018(EC) -> R5-cross-signed-by-R3 -> R3-cross-signed-by-R1:
+             * the two EC links pair up fine, but the cross-cert links above
+             * them are RSA-signed, which tls12_trust_verify_ecdsa cannot
+             * check, so TWO certs stay unverified. Requiring exactly one top
+             * failed these chains closed in Safari ("certificate invalid")
+             * even though every needed root was in the bundle. Instead, EVERY
+             * unverified cert must anchor to the bundle (checked below) --
+             * the cross-cert tail walks there over RSA links. unver == 0 is
+             * still rejected: a set where every cert is signed by another
+             * member has no top at all and can never reach an anchor. */
+            if (unver < 1) {
+                tlsTrustLog("tls12TrustEvaluateOpenSSL: no unverified chain top (cycle?)\n");
                 ok = 0;
             }
 
@@ -451,35 +506,174 @@ int tls12TrustEvaluateOpenSSL(CFArrayRef certs, const char *hostname, size_t hos
                 }
             }
 
-            /* the chain top must be issued by a trusted anchor */
-            if (ok && ecLinks > 0 && topIdx >= 0) {
-                void *topCert = owned[topIdx];
-                void *topctx = pCtx_new();
-                int anchored = 0;
-                if (topctx) {
-                    if (pCtx_init(topctx, store, topCert, NULL)) {
-                        int tvr = pVerify(topctx);
-                        int terr = pGetErr ? pGetErr(topctx) : 0;
-                        if (tvr == 1) anchored = 1;
-                        else if (terr == 7) {
-                            void *abio = pBIO_new_file(ANCHOR_BUNDLE, "r");
-                            if (abio) {
-                                void *ax;
-                                while ((ax = pPEM_read(abio, NULL, NULL, NULL)) != NULL) {
-                                    int r = tls12_trust_verify_ecdsa(h, topCert, ax);
-                                    pX509_free(ax);
-                                    if (r == 1) { anchored = 1; break; }
+            /* every unverified cert must chain to a trusted anchor. The store
+             * holds ONLY bundle anchors (peer certs ride the untrusted stack),
+             * so anchoring can never succeed via store membership of a peer
+             * cert; RSA links on the path are verified natively by libcrypto. */
+            if (ok && ecLinks > 0) {
+                int anchored = 1;   /* main store load was validated above */
+                int ui;
+                for (ui = 0; ui < unver && anchored; ui++) {
+                    void *uCert = owned[unverIdx[ui]];
+                    void *uctx = pCtx_new();
+                    int uOk = 0;
+                    if (uctx) {
+                        /* untrusted stack: every OTHER peer cert, so a longer
+                         * RSA cross-cert tail can be walked through to the
+                         * anchor the same way the main verify would. */
+                        void *usk = psk_new();
+                        int k;
+                        if (usk) {
+                            for (k = 0; k < nowned; k++)
+                                if (k != unverIdx[ui]) psk_push(usk, owned[k]);
+                        }
+                        if (pCtx_init(uctx, store, uCert, usk)) {
+                            int tvr = pVerify(uctx);
+                            int terr = pGetErr ? pGetErr(uctx) : 0;
+                            if (tvr == 1) {
+                                uOk = 1;
+                                /* built chain's links all verified natively --
+                                 * record them as issuer edges for connectivity */
+                                {
+                                    void *chn = pGetChain(uctx);
+                                    int cn = chn ? pSkNum(chn) : 0;
+                                    int ci;
+                                    for (ci = 0; ci + 1 < cn; ci++)
+                                        tls12_trust_record_issuer_edge(
+                                            pSkValue(chn, ci), pSkValue(chn, ci + 1),
+                                            owned, nowned, issuerBits);
                                 }
-                                pBIO_free(abio);
+                            } else if (terr == 7) {
+                                /* err 7 may be raised by an ECDSA-SHA2 link
+                                 * ANYWHERE in the built chain, not only by
+                                 * uCert's own link to an anchor. Retry the
+                                 * FAILING SUBJECT (chain[depth]):
+                                 *  - precisely, against chain[depth+1] when
+                                 *    that issuer is a bundle anchor (non-peer);
+                                 *  - at the chain top, when the failing "link"
+                                 *    is a store anchor's own ECDSA self-sig;
+                                 *  - as a fallback, against every bundle
+                                 *    anchor (alternative cross-cert paths,
+                                 *    including a server-sent duplicate of the
+                                 *    anchor itself).
+                                 * Links below the failing one were verified
+                                 * natively during chain building. */
+                                int depth = pGetDepth(uctx);
+                                void *chn = pGetChain(uctx);
+                                int cn = chn ? pSkNum(chn) : 0;
+                                int ci;
+                                for (ci = 0; ci + 1 < cn && ci < depth; ci++)
+                                    tls12_trust_record_issuer_edge(
+                                        pSkValue(chn, ci), pSkValue(chn, ci + 1),
+                                        owned, nowned, issuerBits);
+                                if (depth >= 0 && depth < cn) {
+                                    void *subj = pSkValue(chn, depth);
+                                    if (depth + 1 < cn) {
+                                        void *issr = pSkValue(chn, depth + 1);
+                                        if (tls12_trust_peer_index(issr, owned, nowned) < 0 &&
+                                            tls12_trust_verify_ecdsa(h, subj, issr) == 1)
+                                            uOk = 1;
+                                    } else if (tls12_trust_peer_index(subj, owned, nowned) < 0) {
+                                        /* terminal link is the store anchor's
+                                         * own ECDSA self-signature */
+                                        uOk = 1;
+                                    }
+                                    if (!uOk) {
+                                        void *abio = pBIO_new_file(ANCHOR_BUNDLE, "r");
+                                        if (abio) {
+                                            void *ax;
+                                            while ((ax = pPEM_read(abio, NULL, NULL, NULL)) != NULL) {
+                                                int r = tls12_trust_verify_ecdsa(h, subj, ax);
+                                                pX509_free(ax);
+                                                if (r == 1) { uOk = 1; break; }
+                                            }
+                                            pBIO_free(abio);
+                                        }
+                                    }
+                                }
                             }
                         }
+                        pCtx_free(uctx);
+                        if (usk) psk_free(usk);
                     }
-                    pCtx_free(topctx);
+                    if (uOk) {
+                        tlsTrustLog("tls12TrustEvaluateOpenSSL: cert %d anchored\n",
+                                    unverIdx[ui]);
+                    } else {
+                        tlsTrustLog("tls12TrustEvaluateOpenSSL: cert %d does not reach "
+                                    "a trusted anchor\n", unverIdx[ui]);
+                        anchored = 0;
+                    }
                 }
                 if (anchored) {
-                    result = 0;
-                    tlsTrustLog("tls12TrustEvaluateOpenSSL: chain VALID via manual "
-                                "ECDSA-SHA2 verification (%d EC link(s), anchored)\n", ecLinks);
+                    /* Connectivity: every cert must be reachable from the
+                     * LEAF by following issuer edges. The pairwise pass alone
+                     * would let a set containing a detached attacker cycle
+                     * (two certs that sign each other) pass as "verified"
+                     * while an unrelated, legitimately anchored cert
+                     * satisfies the top checks; leaf-to-top reachability
+                     * kills that and any decoy tail with it. The leaf is the
+                     * cert whose SAN matches the hostname -- list order is
+                     * not reliable (see the SAN note below). */
+                    int root = -1, ci, head = 0, tail = 0;
+                    int queue[64], seen[64];
+                    for (ci = 0; ci < nowned; ci++) seen[ci] = 0;
+                    if (hostname && hostlen > 0) {
+                        for (ci = 0; ci < nowned && root < 0; ci++) {
+                            int idx = pExtByNID(owned[ci], NID_subject_alt_name, -1);
+                            void *ext = idx >= 0 ? pGetExt(owned[ci], idx) : NULL;
+                            void *os = ext ? pExtData(ext) : NULL;
+                            const unsigned char *der = os ? pStrData(os) : NULL;
+                            int derlen = os ? pStrLen(os) : 0;
+                            if (der && derlen > 0 &&
+                                tls12_san_matches(der, derlen, hostname, hostlen))
+                                root = ci;
+                        }
+                    }
+                    if (hostname && hostlen > 0 && root < 0) {
+                        /* no cert carries the expected hostname: the fatal SAN
+                         * check below would reject anyway; reject here with a
+                         * clearer message */
+                        tlsTrustLog("tls12TrustEvaluateOpenSSL: no cert SAN matches "
+                                    "hostname -- cannot locate leaf\n");
+                        result = -1;
+                    } else {
+                        if (root < 0) {
+                            /* non-SSL policy (no hostname): fall back to the
+                             * first cert; ordering pathologies surface as a
+                             * reachability rejection rather than silent accept */
+                            root = 0;
+                        }
+                        queue[tail++] = root;
+                        seen[root] = 1;
+                        while (head < tail) {
+                            uint64_t bits = issuerBits[queue[head++]];
+                            int nb;
+                            for (nb = 0; nb < nowned; nb++)
+                                if (((bits >> nb) & 1) && !seen[nb]) {
+                                    seen[nb] = 1;
+                                    queue[tail++] = nb;
+                                }
+                        }
+                        for (ci = 0; ci < nowned; ci++) {
+                            if (!seen[ci]) {
+                                tlsTrustLog("tls12TrustEvaluateOpenSSL: cert %d not "
+                                            "reachable from leaf (cert %d) -- "
+                                            "rejecting\n", ci, root);
+                                anchored = 0;
+                                break;
+                            }
+                        }
+                        if (anchored) {
+                            result = 0;
+                            tlsTrustLog("tls12TrustEvaluateOpenSSL: chain VALID via "
+                                        "manual ECDSA-SHA2 verification (%d EC link(s), "
+                                        "%d top cert(s) anchored, all certs reachable "
+                                        "from leaf)\n", ecLinks, unver);
+                        } else {
+                            result = -1;
+                        }
+                    }
                 } else {
                     tlsTrustLog("tls12TrustEvaluateOpenSSL: EC links OK but no trusted anchor\n");
                     result = -1;
